@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版）
-- タイトル: 「開催場 R 距離」形式（例: 札幌 4R 芝1600）
-- 発走時刻: HH:MM発走 を表示
-- ◎/○: 単勝オッズ併記。未取得時は「オッズ未確定」
-- ヘッダーに「※オッズは取得時点のものです」を明記
-- 的中率フィルタ（安全レース抽出）は「オッズが揃っている日だけ」適用
+- スコアは全レース横断で計算し、高い順に採用
+- 「堅い基準」を満たすレースのみ最大5件
+- 足りない分は「※閾値対象外につき参考」で補完（スコア上位から）
+- ◎/○ の間は改行、単勝オッズ併記（未取得は「オッズ未確定」）
+- タイトル: 「開催場 R 距離」＋ 発走時刻
+- ヘッダーに「※オッズは取得時点のものです」
+
+GitHub Actions:
+  - 土曜/日曜の 7:00 JST 実行（cronは UTC 22:00 の金曜/土曜）
 """
 
 import os, re, time, unicodedata, datetime as dt, random
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import requests
 from bs4 import BeautifulSoup
 
@@ -19,25 +23,33 @@ TIMEOUT = 12
 SLEEP_SEC = 0.25
 DISCORD_CHUNK = 1800
 
-# 的中率モードのしきい値（必要に応じて環境変数で調整）
-HIT_O1_MAX = float(os.getenv("HIT_O1_MAX", "1.8"))   # 1人気の最大許容オッズ
-HIT_GAP_MIN = float(os.getenv("HIT_GAP_MIN", "0.7"))  # 2-1人気ギャップ最小
-HIT_MAX_HEADS = int(os.getenv("HIT_MAX_HEADS", "10")) # 小頭数しきい値
+# 閾値（“堅い基準”）— 必要なら環境変数で調整
+O1_MAX   = float(os.getenv("O1_MAX",   "2.0"))  # 1人気の最大許容オッズ
+GAP_MIN  = float(os.getenv("GAP_MIN",  "0.7"))  # (2人気 - 1人気) の最小差
+HC_MAX   = int  (os.getenv("HC_MAX",   "12"))   # 小頭数しきい値
+EXCLUDE_WORDS = [w.strip() for w in os.getenv(
+    "EXCLUDE_WORDS",
+    "新馬,2歳,２歳,未勝利,重賞,オープン,障害,混合"
+).split(",") if w.strip()]
 
+# 表示/UA
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.3"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.5"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
 
+# 丸数字
 CIRCLES = {i: chr(9311+i) for i in range(1, 21)}  # ①..⑳
+def circled(n: int) -> str: return CIRCLES.get(n, f"[{n}]")
+
+# 開催場
 JRA_VENUES = ("札幌","函館","福島","新潟","東京","中山","中京","京都","阪神","小倉")
 
-def circled(n: int) -> str: return CIRCLES.get(n, f"[{n}]")
 def now_jst(): return dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
 def now_jst_str(): return now_jst().strftime("%Y-%m-%d (%a) %H:%M JST")
 def norm(s: str) -> str: return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", unicodedata.normalize("NFKC", s or ""))
@@ -55,16 +67,16 @@ def make_session():
         pass
     return s
 
-# ===== 日付解決（JST・金/土の夜運用を想定） =====
+# ===== 日付解決（JST・週末運用） =====
 def resolve_target_date() -> str:
     env = (os.getenv("TARGET_DATE") or "").strip()
     if re.fullmatch(r"\d{8}", env):  # YYYYMMDD
         return env
+    # 近い土日を採用（Actions は 7:00 JST 実行を想定）
     now = now_jst()
     d = now.date()
-    if now.hour >= 21:
-        d = d + dt.timedelta(days=1)
-    while d.weekday() not in (5, 6):  # Sat/Sun
+    # 当日が土日ならその日、違えば次の土日まで進める
+    while d.weekday() not in (5, 6):  # 5=Sat, 6=Sun
         d += dt.timedelta(days=1)
     return d.strftime("%Y%m%d")
 
@@ -99,7 +111,7 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
         url = f"https://sports.yahoo.co.jp/keiba/race/list/{lid}"
         page = fetch(session, url)
         if not page: continue
-        if target in page:  # ページ見出しに対象日付が入っている
+        if target in page:
             out.append(url)
         time.sleep(0.1 + random.random()*0.2)
     return out
@@ -146,7 +158,7 @@ def fetch_denma_names(session, rid: str) -> Dict[int,str]:
 # ===== オッズ(tfw)からメタ/オッズ取得（メインの真実ソース） =====
 def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     """
-    tfwページから: venue / R(rid末尾2桁) / course距離 / post_time を抽出
+    tfwページから: venue / R(rid末尾2桁) / course距離 / post_time / race_name を抽出
     タイトルは「<venue> <R> <course or race_name>」
     """
     t = clean_line(txt)
@@ -173,13 +185,8 @@ def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     title = " ".join(x for x in [venue, R, course or race_name] if x)
     return {"venue": venue, "R": R, "course": course, "post_time": post, "race_name": race_name, "title": title or f"{venue} {R}".strip()}
 
-def fetch_odds_and_meta(session, rid: str):
-    """
-    tfwから
-      - odds_map: {馬番: 単勝}
-      - meta: {title, post_time, ...}
-    を返す
-    """
+def fetch_odds_and_meta(session, rid: str) -> Tuple[Dict[int,float], dict]:
+    """tfwから {馬番:単勝} と メタ情報 を返す"""
     url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
     html = fetch(session, url)
     if not html: return {}, {"title":"（レース）","post_time":""}
@@ -205,24 +212,23 @@ def fetch_odds_and_meta(session, rid: str):
     return odds, meta
 
 # ===== スコアリング・券種 =====
-UPSET_WORDS = ["新馬","2歳","２歳","重賞","オープン","障害","混合","未勝利"]
-
-def is_low_variance_race(title: str, headcount: Optional[int], o1, o2) -> bool:
+def is_hard_race(title: str, headcount: Optional[int], o1, o2) -> bool:
+    """“堅い基準”を満たすかどうか"""
     t = title or ""
-    if any(w in t for w in UPSET_WORDS):
+    if any(w in t for w in EXCLUDE_WORDS):
         return False
     try:
         if o1 is None or o2 is None: return False
-        o1f = float(o1)
-        o2f = float(o2)
-        if o1f > HIT_O1_MAX: return False
-        if (o2f - o1f) < HIT_GAP_MIN: return False
-        if (headcount is not None) and headcount > HIT_MAX_HEADS: return False
+        o1f = float(o1); o2f = float(o2)
+        if o1f > O1_MAX: return False
+        if (o2f - o1f) < GAP_MIN: return False
+        if (headcount is not None) and headcount > HC_MAX: return False
         return True
     except:
         return False
 
 def score(o1, o2, hc):
+    """本命の強さ・人気差・小頭数を重視"""
     s=0.0
     try:
         if o1 is not None: s += max(0.0, (6.0 - float(o1))) * 12
@@ -232,6 +238,7 @@ def score(o1, o2, hc):
     return round(s,2)
 
 def pick_primary_bet(o1, o2, hc, rank):
+    """保守的：基本は単勝。断然+差+小頭数で馬連、情報薄や多頭数は複勝/ワイド"""
     defaults = {1:"単勝（1点）", 2:"ワイド（1点）", 3:"複勝（1点）", 4:"単勝（1点）", 5:"ワイド（1点）"}
     choice = defaults.get(rank, "単勝（1点）")
     try:
@@ -240,9 +247,9 @@ def pick_primary_bet(o1, o2, hc, rank):
         gap = (o2f - o1f) if (o1f is not None and o2f is not None) else None
         if o1f is not None and o1f <= 1.5:
             choice = "単勝（1点）"
-            if gap is not None and gap >= 1.0 and (hc is not None and hc <= HIT_MAX_HEADS):
+            if gap is not None and gap >= 1.0 and (hc is not None and hc <= HC_MAX):
                 choice = "馬連（1点）"
-        elif o1f is not None and o1f <= 2.0 and (hc is not None and hc <= HIT_MAX_HEADS):
+        elif o1f is not None and o1f <= 2.0 and (hc is not None and hc <= HC_MAX):
             choice = "ワイド（1点）"
         if hc is not None and hc >= 12:
             choice = "複勝（1点）"
@@ -274,6 +281,8 @@ def build_message(items):
         lines.append(f"◎{left}")
         lines.append(f"○{right}")
         lines.append(f"推奨：{bet}")
+        if it.get("reference_only"):
+            lines.append("※閾値対象外につき参考")
         lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
         if idx < min(len(items), TOP_K): lines.append("---")
     return "\n".join(lines)
@@ -369,17 +378,31 @@ def main():
         row = process_one(sess, rid)
         if row: results.append(row)
 
-    # 4) 的中率モード：オッズが揃っているときだけ適用
-    has_any_odds = any((it.get("o1") is not None and it.get("o2") is not None) for it in results)
-    if has_any_odds:
-        safe = [it for it in results if is_low_variance_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2"))]
-        if safe: results = safe
-
-    # 5) スコア降順 → 出力
+    # 4) スコア順に全レースを並べる
     results.sort(key=lambda x: x["score"], reverse=True)
-    msg = build_message(results)
 
-    # 6) 通知
+    # 5) “堅い基準”で抽出（オッズが出てるレースのみ判定可能）
+    hard = []
+    for it in results:
+        if is_hard_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2")):
+            hard.append({**it, "reference_only": False})
+
+    # 6) 不足分を“参考”で補完（スコア上位から）
+    picked = []
+    picked_ids=set()
+    for it in hard[:TOP_K]:
+        picked.append(it); picked_ids.add(id(it))
+    if len(picked) < TOP_K:
+        for it in results:
+            if id(it) in picked_ids:  # 既に採用済み（同一オブジェクト）ならスキップ
+                continue
+            # 閾値対象外として補完
+            picked.append({**it, "reference_only": True})
+            if len(picked) >= TOP_K:
+                break
+
+    # 7) 出力
+    msg = build_message(picked)
     print("----- 通知本文 -----")
     print(msg)
     send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL",""))
