@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版・表示&精度修正）
-- タイトル/発走時刻/場名/距離は **オッズ(tfw)ページ**から抽出（ナビ1R誤認を回避）
-- R番号は **race_idの下2桁**で確定
-- 馬名は denma 由来でも **性別/年齢/毛色/斤量っぽい表記を除去** して表示
+中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版）
+- タイトル: 「開催場 R 距離」形式（例: 札幌 4R 芝1600）
+- 発走時刻: HH:MM発走 を表示
+- ◎/○: 単勝オッズ併記。未取得時は「オッズ未確定」
 - ヘッダーに「※オッズは取得時点のものです」を明記
+- 的中率フィルタ（安全レース抽出）は「オッズが揃っている日だけ」適用
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -18,14 +19,15 @@ TIMEOUT = 12
 SLEEP_SEC = 0.25
 DISCORD_CHUNK = 1800
 
-HIT_O1_MAX = float(os.getenv("HIT_O1_MAX", "1.8"))
-HIT_GAP_MIN = float(os.getenv("HIT_GAP_MIN", "0.7"))
-HIT_MAX_HEADS = int(os.getenv("HIT_MAX_HEADS", "10"))
+# 的中率モードのしきい値（必要に応じて環境変数で調整）
+HIT_O1_MAX = float(os.getenv("HIT_O1_MAX", "1.8"))   # 1人気の最大許容オッズ
+HIT_GAP_MIN = float(os.getenv("HIT_GAP_MIN", "0.7"))  # 2-1人気ギャップ最小
+HIT_MAX_HEADS = int(os.getenv("HIT_MAX_HEADS", "10")) # 小頭数しきい値
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.2"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.3"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
@@ -53,12 +55,11 @@ def make_session():
         pass
     return s
 
-# ===== 日付解決 =====
+# ===== 日付解決（JST・金/土の夜運用を想定） =====
 def resolve_target_date() -> str:
     env = (os.getenv("TARGET_DATE") or "").strip()
     if re.fullmatch(r"\d{8}", env):  # YYYYMMDD
         return env
-    # 金/土の夜運用前提で、近い土日を採用
     now = now_jst()
     d = now.date()
     if now.hour >= 21:
@@ -71,6 +72,7 @@ def resolve_target_date() -> str:
 MONTHLY_URL = "https://sports.yahoo.co.jp/keiba/schedule/monthly/"
 LIST_RE = re.compile(r"/keiba/race/list/(\d{8})")
 RACE_INDEX_RE = re.compile(r"/keiba/race/index/(\d{10})")
+_ODDS_FLOAT_RE = re.compile(r"\b(\d{1,3}\.\d)\b")
 
 def fetch(session, url, timeout=TIMEOUT) -> Optional[str]:
     r = session.get(url, timeout=timeout, allow_redirects=True)
@@ -102,17 +104,15 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
         time.sleep(0.1 + random.random()*0.2)
     return out
 
-def parse_race_list_page(html: str):
-    """
-    各Rの {race_id} を返す（タイトル/時刻はオッズページから正規取得するのでここでは仮は持たない）
-    """
+def parse_race_list_page(html: str) -> List[str]:
+    """各レースの race_id(10桁) を収集（タイトル/時刻はオッズページで取得）"""
     soup = BeautifulSoup(html, "html.parser")
     ids=[]
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
         m = RACE_INDEX_RE.search(href)
         if not m: continue
-        rid = m.group(1)  # 10桁
+        rid = m.group(1)
         if rid not in ids: ids.append(rid)
     return ids
 
@@ -121,7 +121,7 @@ NAME_NOISE_RE = re.compile(r"\s*[牡牝セ騸]\d(?:/)?[^\s（）()]*")  # 例: "
 def clean_horse_name(nm: str) -> str:
     nm = clean_line(nm)
     nm = NAME_NOISE_RE.sub("", nm)
-    nm = re.sub(r"\s*(?:[（(].*?[）)])\s*$", "", nm)  # 末尾の括弧注釈を除去
+    nm = re.sub(r"\s*(?:[（(].*?[）)])\s*$", "", nm)  # 末尾の（注記）除去
     return nm.strip()
 
 def fetch_denma_names(session, rid: str) -> Dict[int,str]:
@@ -144,19 +144,13 @@ def fetch_denma_names(session, rid: str) -> Dict[int,str]:
     return names
 
 # ===== オッズ(tfw)からメタ/オッズ取得（メインの真実ソース） =====
-_ODDS_FLOAT_RE = re.compile(r"\b(\d{1,3}\.\d)\b")
 def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     """
-    tfwページから:
-      - venue（例: 中京）
-      - R（ridの下2桁）
-      - course+distance（例: ダート1800m / 芝1200m）
-      - post_time（HH:MM発走）
-      - race_name（例: 揖斐川特別 / サラ系3歳未勝利）
-    を抽出してタイトルを「<venue> <R> <course>」に整形
+    tfwページから: venue / R(rid末尾2桁) / course距離 / post_time を抽出
+    タイトルは「<venue> <R> <course or race_name>」
     """
     t = clean_line(txt)
-    # venue（「3回中京6日」のような部分から場名を抽出）
+    # venue
     venue = ""
     for v in JRA_VENUES:
         if v in t:
@@ -164,12 +158,12 @@ def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     # R：rid末尾2桁
     rnum = int(rid[-2:])
     R = f"{rnum}R"
-    # race_name：h2/h3見出し優先
+    # race_name（保険）
     race_name = ""
     mname = re.search(r"(?:^|[\s#])([一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+特別|[一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+ステークス|サラ系[^\s]+|新馬戦|未勝利|オープン|G[ⅠI]{1,3}|L)\b", t)
     if mname:
         race_name = mname.group(1)
-    # course/distance（例: 芝・右 1200m / ダート・左 1800m）
+    # course/distance
     mcd = re.search(r"(芝|ダート|障害)[^0-9]{0,6}([1-4]\d{2,3})m", t)
     course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
     # 発走時刻
@@ -201,7 +195,7 @@ def fetch_odds_and_meta(session, rid: str):
             continue
         # 単勝（最初の小数）
         m = _ODDS_FLOAT_RE.search(" ".join(tds[3:5]))
-        if not m: 
+        if not m:
             continue
         try:
             odds[uma] = float(m.group(1))
@@ -264,18 +258,21 @@ def build_message(items):
     for idx, it in enumerate(items[:TOP_K], 1):
         title = clean_line(it.get('title') or "")
         ptime = clean_line(it.get('post_time') or "")
-        # ◎○表記（馬番＋馬名＋単勝）
-        left = "1人気想定"
-        right = "2人気想定"
+        # ◎/○（改行＆未確定対応）
         if it.get("no1"):
             left = f"{circled(it['no1'])}" + (f" {it.get('name1')}" if it.get('name1') else "")
-            if it.get("o1") is not None: left += f"（単勝{it['o1']}）"
+            left += f"（単勝{it['o1']}）" if it.get("o1") is not None else "（オッズ未確定）"
+        else:
+            left = "1人気想定（オッズ未確定）" if it.get("o1") is None else f"1人気想定（単勝{it['o1']}）"
         if it.get("no2"):
             right = f"{circled(it['no2'])}" + (f" {it.get('name2')}" if it.get('name2') else "")
-            if it.get("o2") is not None: right += f"（単勝{it['o2']}）"
+            right += f"（単勝{it['o2']}）" if it.get("o2") is not None else "（オッズ未確定）"
+        else:
+            right = "2人気想定（オッズ未確定）" if it.get("o2") is None else f"2人気想定（単勝{it['o2']}）"
         bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
         lines.append(f"【{idx}位】{title} {ptime}".rstrip())
-        lines.append(f"◎{left}  ○{right}")
+        lines.append(f"◎{left}")
+        lines.append(f"○{right}")
         lines.append(f"推奨：{bet}")
         lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
         if idx < min(len(items), TOP_K): lines.append("---")
@@ -372,9 +369,11 @@ def main():
         row = process_one(sess, rid)
         if row: results.append(row)
 
-    # 4) 的中率モード：安全レースのみ抽出
-    safe = [it for it in results if is_low_variance_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2"))]
-    if safe: results = safe
+    # 4) 的中率モード：オッズが揃っているときだけ適用
+    has_any_odds = any((it.get("o1") is not None and it.get("o2") is not None) for it in results)
+    if has_any_odds:
+        safe = [it for it in results if is_low_variance_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2"))]
+        if safe: results = safe
 
     # 5) スコア降順 → 出力
     results.sort(key=lambda x: x["score"], reverse=True)
