@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 中央競馬（JRA） “今日の堅そう” ランキング TOP5 を生成し、Discord/LINE へ通知。
-修正版：
-- 予想オッズ(yoso)ではなく 実オッズ(tan) を優先取得
-- 発走時刻は「発走」の近傍のみを採用（07/05 誤検出対策）
-- 馬番ベースで単勝を確実抽出（odds/tan.html対応）
+v1.2 収集強化版：
+- JRAで race_id が最も揃う /race/list.html?kaisai_date=YYYYMMDD を優先走査
+- href だけでなく data-race-id 属性からも抽出
+- 収集ログを詳細化（どのURLで何件拾えたか表示）
+- 実オッズ(tan)優先・発走時刻の誤検知対策は前版のまま
 
-使い方は以前と同じ。GitHub Actionsの週末22:00スケジュールで前日分を出力。
+使い方は同じ（週末22:00 JSTで翌日分を取得）。TARGET_DATE=YYYYMMDDで手動指定可。
 """
 
 import os, re, time, unicodedata, datetime as dt, random
-from urllib.parse import urlunparse, urlencode
+from urllib.parse import urlunparse, urlencode, urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -25,9 +26,9 @@ PROBE_R = [1, 2, 3]
 VENUES = r"(札幌|函館|新潟|東京|中山|中京|京都|阪神|小倉)"
 DISCORD_CHUNK = 1800
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
-ANALYZE_WORKERS = int(os.getenv("ANALYZE_WORKERS", "10"))
-FALLBACK_BUDGET_SEC = int(os.getenv("FALLBACK_BUDGET_SEC", "180"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
+ANALYZE_WORKERS = int(os.getenv("ANALYZE_WORKERS", "8"))
+FALLBACK_BUDGET_SEC = int(os.getenv("FALLBACK_BUDGET_SEC", "240"))
 
 # --- 的中率モードのしきい値（環境変数で調整可） ---
 HIT_O1_MAX   = float(os.getenv("HIT_O1_MAX", "1.8"))
@@ -36,7 +37,7 @@ HIT_MAX_HEADS= int(os.getenv("HIT_MAX_HEADS", "10"))
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36 KeibaNotifier/central-1.1"),
+                   "(KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36 KeibaNotifier/central-1.2"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://race.sp.netkeiba.com/",
     "Cache-Control": "no-cache",
@@ -85,52 +86,95 @@ def normalize_name(s: str) -> str:
     return s.lower()
 
 # ---------- 収集（race_id 抽出） ----------
-RACE_ID_RE = re.compile(r"race_id=(\d{12})\b")
-LINK_RE    = re.compile(r"(shutuba|odds|yoso|index|tan|result)\.html", re.I)
+RACE_ID_RE = re.compile(r"\b(?:race_id|id)=(\d{12})\b")
+LINK_RE    = re.compile(r"(shutuba|odds|yoso|index|tan|result|race)\.html", re.I)
 
 def candidate_index_urls(d: str):
+    """
+    JRAは /race/list.html?kaisai_date=YYYYMMDD に race_id が並ぶことが多い。
+    まずはここを優先し、保険に top 系も舐める。
+    """
     return [
+        # race list（最優先）
+        f"https://race.sp.netkeiba.com/race/list.html?kaisai_date={d}",
+        f"https://race.netkeiba.com/race/list.html?kaisai_date={d}",
+        # top（保険）
         f"https://race.sp.netkeiba.com/top/race_list.html?kaisai_date={d}",
-        f"https://race.sp.netkeiba.com/",
         f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d}",
         f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={d}",
+        f"https://race.sp.netkeiba.com/",
         f"https://race.netkeiba.com/top/?kaisai_date={d}",
     ]
 
+def extract_race_ids_from_html(html: str, d: str):
+    """hrefのクエリと data-race-id 属性の双方から収集"""
+    ids=[]; soup = BeautifulSoup(html, "html.parser")
+    # 1) a[href] から
+    for a in soup.select("a[href]"):
+        href = a.get("href") or ""
+        if not LINK_RE.search(href): 
+            # list内の <li data-race-id="..."> に aタグが別で付く場合もある
+            pass
+        # href から race_id= を抜く
+        m = RACE_ID_RE.search(href)
+        if m and m.group(1).startswith(d):
+            ids.append(m.group(1)); continue
+        # クエリパラメータを総当たりで見る
+        try:
+            q = parse_qs(urlparse(href).query)
+            for key in ("race_id","id"):
+                if key in q and q[key]:
+                    val = q[key][0]
+                    if re.fullmatch(r"\d{12}", val) and val.startswith(d):
+                        ids.append(val); break
+        except: 
+            pass
+    # 2) data-race-id （spのリストでよく使われる）
+    for tag in soup.find_all(attrs={"data-race-id": True}):
+        rid = tag.get("data-race-id")
+        if rid and re.fullmatch(r"\d{12}", rid) and rid.startswith(d):
+            ids.append(rid)
+    # 3) 生テキスト中の race_id=12桁（保険）
+    ids += [m.group(1) for m in RACE_ID_RE.finditer(html) if m.group(1).startswith(d)]
+
+    # ユニークに
+    out=[]; seen=set()
+    for x in ids:
+        if x in seen: continue
+        seen.add(x); out.append(x)
+    return out
+
 def collect_race_ids_from_lists(session, d: str):
-    ids=[]
+    all_ids=[]
     for url in candidate_index_urls(d):
         try:
             html = fetch(session, url)
-            if not html: continue
-            ids += [m.group(1) for m in RACE_ID_RE.finditer(html) if m.group(1).startswith(d)]
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.select("a[href]"):
-                href = a.get("href") or ""
-                if not LINK_RE.search(href): continue
-                m = RACE_ID_RE.search(href)
-                if m and m.group(1).startswith(d): ids.append(m.group(1))
+            if not html: 
+                print(f"[INFO] fetch失敗: {url}")
+                continue
+            ids = extract_race_ids_from_html(html, d)
+            print(f"[INFO] 収集: {len(ids):3d}件 from {url}")
+            all_ids.extend(ids)
         except Exception as e:
             print(f"[WARN] index fail: {url} -> {e}")
         time.sleep(0.12 + random.random()*0.2)
     # ユニーク
     seen,out=set(),[]
-    for x in ids:
+    for x in all_ids:
         if x in seen: continue
         seen.add(x); out.append(x)
-    print(f"[INFO] 一覧から収集: {len(out)}件 ({d})")
+    print(f"[INFO] 一覧から収集 合計: {len(out)}件 ({d})")
     return out
 
 # ---------- フォールバック（開催検出→全R） ----------
 def rid_for(d: str, cc: int, rr: int) -> str:
+    # JRAの内部コードは公表されていないが、list系で拾えない場合の最終手段として残す
     return f"{d[:4]}{cc:02d}{d[4:]}{rr:02d}"
 
 def candidate_odds_urls(rid: str):
-    # 単勝（実オッズ）を最優先
     for host, path in [
         ("race.sp.netkeiba.com","/odds/tan.html"),
         ("race.netkeiba.com","/odds/tan.html"),
-        # 予想・インデックスは保険
         ("race.sp.netkeiba.com","/odds/yoso.html"),
         ("race.netkeiba.com","/odds/yoso.html"),
         ("race.sp.netkeiba.com","/odds/index.html"),
@@ -191,15 +235,12 @@ def bruteforce_race_ids(session, d: str):
 
 # ---------- 解析（shutuba:馬名 → tan/yoso:オッズ） ----------
 def fetch_odds_html(session, rid: str):
-    # tan → yoso → index の順で返す（最初に見つかったもの）
     for u in candidate_odds_urls(rid):
         html = fetch(session, u)
         if not html: continue
         t = norm(html)
-        # tan は「単勝」「人気」「馬番」などが含まれやすい
         if ("odds/tan" in u and "単勝" in t):
             return ("tan", html)
-        # yoso は「予想オッズ」表現が多い
         if ("odds/yoso" in u and ("予想オッズ" in t or "オッズ" in t)):
             return ("yoso", html)
         if ("odds/index" in u and "オッズ" in t):
@@ -217,7 +258,6 @@ def parse_race_meta_from_text(txt: str):
     t = clean_line(txt)
     m = re.search(rf"{VENUES}[^0-9]{{0,6}}(\d{{1,2}}R)", t)
     title = f"{m.group(1)} {m.group(2)}" if m else (re.search(r"(\d{1,2}R)", t).group(1) if re.search(r"(\d{1,2}R)", t) else "（開催/レース不明）")
-    # 時刻は「発走」の近傍のみ採用（誤検出防止）
     tm = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or
           re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t) or
           re.search(r"([01]?\d|2[0-3])時([0-5]\d)分\s*発走", t) or
@@ -277,16 +317,11 @@ def parse_shutuba_names(html: str):
 _ODDS_FLOAT_RE = re.compile(r"\b(\d{1,3}\.\d)\b")
 
 def parse_tan_odds_by_row(html: str, names_map: dict):
-    """
-    odds/tan.html から {馬番: 単勝} を取る。
-    馬番・馬名・単勝の列が揃っている前提で、行テキストから抽出（構造変化に強め）。
-    """
     soup = BeautifulSoup(html, "html.parser")
     out = {}
     for tr in soup.find_all("tr"):
         txt = clean_line(tr.get_text(" "))
         if not txt: continue
-        # 馬番
         m_no = re.search(r"\b(\d{1,2})\b", txt)
         if not m_no: continue
         try:
@@ -294,14 +329,12 @@ def parse_tan_odds_by_row(html: str, names_map: dict):
             if not (1 <= no <= 20): continue
         except: 
             continue
-        # 単勝
         m_od = _ODDS_FLOAT_RE.search(txt)
         if not m_od: 
             continue
         try:
             odds = float(m_od.group(1))
-            if not (1.0 <= odds <= 400.0):
-                continue
+            if not (1.0 <= odds <= 400.0): continue
         except:
             continue
         out.setdefault(no, odds)
@@ -488,6 +521,19 @@ def send_line(msg: str, token: str):
         print(f"[LINE] 送信エラー: {e}")
 
 # ---------- 1レース処理（shutuba→tan/yosoの順） ----------
+def fetch_odds_html(session, rid: str):
+    for u in candidate_odds_urls(rid):
+        html = fetch(session, u)
+        if not html: continue
+        t = norm(html)
+        if ("odds/tan" in u and "単勝" in t):
+            return ("tan", html)
+        if ("odds/yoso" in u and ("予想オッズ" in t or "オッズ" in t)):
+            return ("yoso", html)
+        if ("odds/index" in u and "オッズ" in t):
+            return ("index", html)
+    return (None, None)
+
 def process_one(session, rid: str):
     try:
         # 1) 馬名を先に確定
@@ -504,7 +550,6 @@ def process_one(session, rid: str):
             if odds_src == "tan":
                 odds_map = parse_tan_odds_by_row(odds_html, names)  # {馬番: 単勝}
             else:
-                # yoso/index は名前ベースの緩い取得
                 if names:
                     odds_map = parse_yoso_odds_by_name(odds_html, names)
 
@@ -517,7 +562,7 @@ def process_one(session, rid: str):
             else:
                 return None
 
-        # 4) 発走時刻の補完（空なら広域探索。無関係な時刻は拾わない仕様に変更）
+        # 4) 発走時刻の補完
         if not meta.get("post_time"):
             meta["post_time"] = get_post_time(session, rid) or ""
 
@@ -550,7 +595,7 @@ def main():
     print(f"[INFO] 対象日(JRA): {ymd}")
     session = make_session()
 
-    # 1) 一覧収集
+    # 1) 一覧収集（詳しくログ）
     ids = collect_race_ids_from_lists(session, ymd)
 
     # 2) 少ない/0件ならフォールバック
