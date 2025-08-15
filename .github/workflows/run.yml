@@ -1,16 +1,17 @@
-name: weekend-run
+name: weekend-jra (sportsnavi)
 
 on:
   schedule:
-    # 金曜 22:00 JST（= 金曜 13:00 UTC）→ 土曜分を出す
+    # 金曜 22:00 JST（= 13:00 UTC）→ 土曜開催
     - cron: "0 13 * * 5"
-    # 土曜 22:00 JST（= 土曜 13:00 UTC）→ 日曜分を出す
+    # 土曜 22:00 JST（= 13:00 UTC）→ 日曜開催
     - cron: "0 13 * * 6"
-  workflow_dispatch: {}   # 手動実行ボタン（祝日開催などは手動で実行）
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,11 +21,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Resolve TARGET_DATE (JST weekend rule)
+        id: d
+        run: |
+          python - <<'PY'
+          import datetime as dt, json, os
+          JST = dt.timezone(dt.timedelta(hours=9))
+          now = dt.datetime.now(JST)
+          d = now.date()
+          if now.hour >= 21: d = d + dt.timedelta(days=1)
+          while d.weekday() not in (5,6): d += dt.timedelta(days=1)  # Sat/Sun
+          print(f"::set-output name=ymd::{d.strftime('%Y%m%d')}")
+          PY
+
+      - name: Run
         env:
-          # Discordへ送る場合は Secrets に DISCORD_WEBHOOK_URL を登録してください
+          TARGET_DATE: ${{ steps.d.outputs.ymd }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LINE_NOTIFY_TOKEN: ${{ secrets.LINE_NOTIFY_TOKEN }}
         run: python main.py
