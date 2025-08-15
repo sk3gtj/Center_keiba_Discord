@@ -1,21 +1,30 @@
-name: daily-run
+name: weekend-run
 
 on:
   schedule:
-    # 22:00 JST は 13:00 UTC
-    - cron: "0 13 * * *"
-  workflow_dispatch: {}   # 手動実行ボタン
+    # 金曜 22:00 JST（= 金曜 13:00 UTC）→ 土曜分を出す
+    - cron: "0 13 * * 5"
+    # 土曜 22:00 JST（= 土曜 13:00 UTC）→ 日曜分を出す
+    - cron: "0 13 * * 6"
+  workflow_dispatch: {}   # 手動実行ボタン（祝日開催などは手動で実行）
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
       - name: Run script
         env:
+          # Discordへ送る場合は Secrets に DISCORD_WEBHOOK_URL を登録してください
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main.py
