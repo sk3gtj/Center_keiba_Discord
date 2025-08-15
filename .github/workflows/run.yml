@@ -1,17 +1,16 @@
-name: weekend-jra (sportsnavi)
+name: Center Keiba (JRA) – Weekend 7:00 JST
 
 on:
   schedule:
-    # 金曜 22:00 JST（= 13:00 UTC）→ 土曜開催
-    - cron: '0 11 * * *'  # JST 20:00
-    # 土曜 22:00 JST（= 13:00 UTC）→ 日曜開催
-    - cron: "0 13 * * 6"
+    # JST 7:00 は UTC 22:00（前日）。土曜・日曜の 7:00 に実行
+    - cron: "0 22 * * 5,6"
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,24 +21,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Resolve TARGET_DATE (JST weekend rule)
-        id: d
+        # 既に requirements.txt がある場合はこちらを使う
         run: |
-          python - <<'PY'
-          import datetime as dt, json, os
-          JST = dt.timezone(dt.timedelta(hours=9))
-          now = dt.datetime.now(JST)
-          d = now.date()
-          if now.hour >= 21: d = d + dt.timedelta(days=1)
-          while d.weekday() not in (5,6): d += dt.timedelta(days=1)  # Sat/Sun
-          print(f"::set-output name=ymd::{d.strftime('%Y%m%d')}")
-          PY
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4
+          fi
 
-      - name: Run
+      - name: Run script
         env:
-          TARGET_DATE: ${{ steps.d.outputs.ymd }}
+          # 必要ならDiscordやLINEの秘密をリポジトリSecretsに設定し、ここで参照
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_NOTIFY_TOKEN: ${{ secrets.LINE_NOTIFY_TOKEN }}
-        run: python main.py
+        run: |
+          python main.py
