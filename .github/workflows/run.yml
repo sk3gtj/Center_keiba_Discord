@@ -3,7 +3,7 @@ name: weekend-jra (sportsnavi)
 on:
   schedule:
     # 金曜 22:00 JST（= 13:00 UTC）→ 土曜開催
-    - cron: "0 13 * * 5"
+    - cron: '0 11 * * *'  # JST 20:00
     # 土曜 22:00 JST（= 13:00 UTC）→ 日曜開催
     - cron: "0 13 * * 6"
   workflow_dispatch: {}
