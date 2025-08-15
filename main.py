@@ -1,58 +1,56 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬（JRA） “今日の堅そう” ランキング TOP5 を生成し、Discord/LINE へ通知。
-v1.3 収集強化（中央版）：
-- /race/list.html?kaisai_date=YYYYMMDD を最優先し、/race/sum/・/top?current_tab=central も探索
-- href の他に data-race-id / data-k_race_id / data-id からも race_id を抽出
-- 生テキスト（script含む）から race_id を抽出
-- 実オッズ(tan)優先・発走時刻は「発走」近傍のみ採用（誤検出防止）
+中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版）
+- 参照サイト例
+  * 月間: https://sports.yahoo.co.jp/keiba/schedule/monthly/?month=8&year=2025
+  * 日別: https://sports.yahoo.co.jp/keiba/race/list/25040207
+  * 出馬表: https://sports.yahoo.co.jp/keiba/race/denma/<race_id>
+  * 単勝/複勝: https://sports.yahoo.co.jp/keiba/race/odds/tfw/<race_id>
+
+実行タイミング（JST想定）:
+  - 金曜 22:00 → 土曜開催分
+  - 土曜 22:00 → 日曜開催分
+  （TARGET_DATE=YYYYMMDD を渡せば任意日付で動作）
+
+出力：
+  “中央競馬 今日の堅そうランキング(最大5件)” を整形し、Discord/LINEに通知
 """
 
 import os, re, time, unicodedata, datetime as dt, random
-from urllib.parse import urlunparse, urlencode, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, List
+from urllib.parse import urlencode, urlunparse
+
 import requests
 from bs4 import BeautifulSoup
 
 # ===== 基本設定 =====
 TOP_K = 5
-TIMEOUT = 10
+TIMEOUT = 12
 SLEEP_SEC = 0.25
-SCAN_R_MAX = 12              # JRAは原則12R
-PROBE_R = [1, 2, 3]
-VENUES = r"(札幌|函館|新潟|東京|中山|中京|京都|阪神|小倉)"
+MAX_WORKERS = 1  # Yahoo側は順次取得で十分＆安全運転
 DISCORD_CHUNK = 1800
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "12"))
-ANALYZE_WORKERS = int(os.getenv("ANALYZE_WORKERS", "8"))
-FALLBACK_BUDGET_SEC = int(os.getenv("FALLBACK_BUDGET_SEC", "240"))
-
-# 的中率モード（調整可能）
-HIT_O1_MAX   = float(os.getenv("HIT_O1_MAX", "1.8"))
-HIT_GAP_MIN  = float(os.getenv("HIT_GAP_MIN", "1.0"))
-HIT_MAX_HEADS= int(os.getenv("HIT_MAX_HEADS", "10"))
+# 的中率モードのしきい値（必要なら環境変数で微調整）
+HIT_O1_MAX = float(os.getenv("HIT_O1_MAX", "1.8"))   # 1人気の最大許容オッズ
+HIT_GAP_MIN = float(os.getenv("HIT_GAP_MIN", "0.7"))  # 2-1人気の最小ギャップ
+HIT_MAX_HEADS = int(os.getenv("HIT_MAX_HEADS", "10")) # 小頭数しきい値
 
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36 KeibaNotifier/central-1.3"),
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.0"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
-    "Referer": "https://race.sp.netkeiba.com/",
+    "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
-CIRCLES = {i: chr(9311+i) for i in range(1, 21)}
-def circled(n: int) -> str: return CIRCLES.get(n, f"[{n}]")
 
-# ---------- ユーティリティ ----------
+CIRCLES = {i: chr(9311+i) for i in range(1, 21)}  # ①…⑳
+def circled(n: int) -> str: return CIRCLES.get(n, f"[{n}]")
 def now_jst(): return dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
 def now_jst_str(): return now_jst().strftime("%Y-%m-%d (%a) %H:%M JST")
 def norm(s: str) -> str: return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", unicodedata.normalize("NFKC", s or ""))
 def clean_line(s: str) -> str: return re.sub(r"\s+", " ", norm(s)).strip()
-
-def resolve_target_date() -> str:
-    env = (os.getenv("TARGET_DATE") or "").strip()
-    if re.fullmatch(r"\d{8}", env): return env
-    return (now_jst() + dt.timedelta(days=1)).strftime("%Y%m%d")
 
 def make_session():
     s = requests.Session(); s.headers.update(HEADERS)
@@ -60,361 +58,193 @@ def make_session():
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
         retry = Retry(total=2, backoff_factor=0.4, status_forcelist=[429,500,502,503,504])
-        s.mount("http://", HTTPAdapter(max_retries=retry)); s.mount("https://", HTTPAdapter(max_retries=retry))
-    except Exception: pass
-    s.cookies.set("device", "sp", domain=".netkeiba.com")
+        s.mount("http://", HTTPAdapter(max_retries=retry))
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+    except Exception:
+        pass
     return s
 
-def fetch(session, url, timeout=TIMEOUT):
+# ===== 日付解決（JSTの週末運用） =====
+def resolve_target_date() -> str:
+    env = (os.getenv("TARGET_DATE") or "").strip()
+    if re.fullmatch(r"\d{8}", env):  # YYYYMMDD
+        return env
+    # 金曜/土曜22:00運用 → 翌開催日（基本：土日）を推定
+    now = now_jst()
+    d = now.date()
+    if now.hour >= 21:  # 21時以降は翌日想定（ゆとりを持たせる）
+        d = d + dt.timedelta(days=1)
+    # 週末補正（最も近い土日へ寄せる）
+    while d.weekday() not in (5, 6):  # 5=Sat, 6=Sun
+        d += dt.timedelta(days=1)
+    return d.strftime("%Y%m%d")
+
+# ===== スポナビ：月間→日別リストURLの抽出 =====
+MONTHLY_URL = "https://sports.yahoo.co.jp/keiba/schedule/monthly/"
+
+LIST_RE = re.compile(r"/keiba/race/list/(\d{8})")
+RACE_INDEX_RE = re.compile(r"/keiba/race/index/(\d{10})")
+ODDS_TANPUKU_RE = re.compile(r"/keiba/race/odds/tfw/(\d{10})")
+DENMA_RE = re.compile(r"/keiba/race/denma/(\d{10})")
+
+def fetch(session, url, timeout=TIMEOUT) -> Optional[str]:
     r = session.get(url, timeout=timeout, allow_redirects=True)
-    if not r.ok: 
-        print(f"[FETCH] {url} -> status={r.status_code}")
+    if not r.ok:
         return None
-    if not r.encoding or r.encoding.lower() in ("iso-8859-1","ascii"):
+    if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
         r.encoding = r.apparent_encoding or "utf-8"
-    text = r.text
-    return text
+    txt = r.text
+    # JS無効の案内はOK。エラーページや403系なら除外
+    bad = ("エラーが発生" in txt) or ("指定のページは見つかりません" in txt)
+    return None if bad else txt
 
-def normalize_name(s: str) -> str:
-    s = norm(s)
-    s = re.sub(r"[\s・\-’'\.!！?？／/]", "", s)
-    return s.lower()
+def monthly_url_for(yyyymmdd: str) -> str:
+    y, m = int(yyyymmdd[:4]), int(yyyymmdd[4:6])
+    return f"{MONTHLY_URL}?month={m}&year={y}"
 
-# ---------- 収集（race_id 抽出） ----------
-RACE_ID_RE = re.compile(r"\b(?:race_id|id)=(\d{12})\b")
-# a[href] のみならず、data- 属性に多様に入っている
-DATA_ATTR_KEYS = ["data-race-id", "data-k_race_id", "data-id", "data-raceid", "data-k-race-id"]
-
-def candidate_index_urls(d: str):
-    # JRAは list や sum が強い。top系は保険として。
-    return [
-        f"https://race.sp.netkeiba.com/race/list.html?kaisai_date={d}",
-        f"https://race.netkeiba.com/race/list.html?kaisai_date={d}",
-        f"https://race.sp.netkeiba.com/race/sum/?kaisai_date={d}",
-        f"https://race.netkeiba.com/race/sum/?kaisai_date={d}",
-        f"https://race.sp.netkeiba.com/top/race_list.html?kaisai_date={d}&current_tab=central",
-        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={d}",
-        f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={d}",
-    ]
-
-def extract_race_ids_from_html(html: str, d: str):
-    ids=set()
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) a[href] から
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        m = RACE_ID_RE.search(href)
-        if m and m.group(1).startswith(d):
-            ids.add(m.group(1))
-        else:
-            # クエリを総当たり
-            try:
-                q = parse_qs(urlparse(href).query)
-                for key in ("race_id","id"):
-                    if key in q and q[key]:
-                        val = q[key][0]
-                        if re.fullmatch(r"\d{12}", val) and val.startswith(d):
-                            ids.add(val)
-            except: 
-                pass
-
-    # 2) data- 属性から
-    for key in DATA_ATTR_KEYS:
-        for tag in soup.find_all(attrs={key: True}):
-            rid = tag.get(key)
-            if rid and re.fullmatch(r"\d{12}", rid) and rid.startswith(d):
-                ids.add(rid)
-
-    # 3) 生テキストから（script含む）
-    for m in RACE_ID_RE.finditer(html):
-        rid = m.group(1)
-        if rid.startswith(d): ids.add(rid)
-
-    return list(ids)
-
-def collect_race_ids_from_lists(session, d: str):
-    all_ids=[]
-    for url in candidate_index_urls(d):
-        try:
-            html = fetch(session, url)
-            if not html:
-                print(f"[INFO] fetch失敗: {url}")
-                continue
-            ids = extract_race_ids_from_html(html, d)
-            print(f"[INFO] 収集: {len(ids):3d}件 from {url}")
-            all_ids.extend(ids)
-        except Exception as e:
-            print(f"[WARN] index fail: {url} -> {e}")
-        time.sleep(0.12 + random.random()*0.2)
-    # ユニーク
-    out=[]; seen=set()
-    for x in all_ids:
-        if x in seen: continue
-        seen.add(x); out.append(x)
-    print(f"[INFO] 一覧から収集 合計: {len(out)}件 ({d})")
+def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
+    """月間ページから “当日の日別レース一覧URL(各競馬場)” を抽出。"""
+    html = fetch(session, monthly_url_for(yyyymmdd))
+    if not html:
+        return []
+    # ページ内の全 list/******** を拾う → 実際に開いて日付見出しに当日が含まれるものに限定
+    list_ids = list(dict.fromkeys(LIST_RE.findall(html)))
+    out = []
+    target = f"{int(yyyymmdd[:4])}年{int(yyyymmdd[4:6])}月{int(yyyymmdd[6:8])}日"
+    for lid in list_ids:
+        url = f"https://sports.yahoo.co.jp/keiba/race/list/{lid}"
+        page = fetch(session, url)
+        if not page:
+            continue
+        if target in page:  # 見出しテキストに “YYYY年M月D日”
+            out.append(url)
+        time.sleep(0.1 + random.random()*0.2)
     return out
 
-# ---------- フォールバック（開催検出→全R） ----------
-def rid_for(d: str, cc: int, rr: int) -> str:
-    return f"{d[:4]}{cc:02d}{d[4:]}{rr:02d}"
-
-def candidate_odds_urls(rid: str):
-    for host, path in [
-        ("race.sp.netkeiba.com","/odds/tan.html"),
-        ("race.netkeiba.com","/odds/tan.html"),
-        ("race.sp.netkeiba.com","/odds/yoso.html"),
-        ("race.netkeiba.com","/odds/yoso.html"),
-        ("race.sp.netkeiba.com","/odds/index.html"),
-        ("race.netkeiba.com","/odds/index.html"),
-    ]:
-        yield urlunparse(("https", host, path, "", urlencode({"race_id": rid}), ""))
-
-def candidate_shutuba_urls(rid: str):
-    for host in ["race.sp.netkeiba.com","race.netkeiba.com"]:
-        yield urlunparse(("https", host, "/race/shutuba.html","", urlencode({"race_id": rid}), ""))
-
-def looks_odds(text: str) -> bool:
-    t = norm(text)
-    return ("オッズ" in t) or ("単勝" in t)
-
-def try_one_rid(session, rid: str) -> bool:
-    for u in candidate_odds_urls(rid):
-        html = fetch(session, u)
-        if html and looks_odds(html): return True
-    for u in candidate_shutuba_urls(rid):
-        html = fetch(session, u)
-        if html and ("出馬表" in norm(html) or "騎手" in norm(html) or "馬名" in norm(html)):
-            return True
-    return False
-
-def bruteforce_race_ids(session, d: str):
-    start=time.time()
-    print(f"[INFO] フォールバック総当たり開始: {d}（予算{FALLBACK_BUDGET_SEC}s）")
-    active=set()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs={}
-        for cc in range(1,100):
-            if time.time()-start > FALLBACK_BUDGET_SEC*0.4: break
-            for rr in PROBE_R:
-                rid = rid_for(d, cc, rr)
-                futs[ex.submit(try_one_rid, session, rid)] = cc
-        for fut in as_completed(futs):
-            try:
-                if fut.result(): active.add(futs[fut])
-            except: pass
-            if time.time()-start > FALLBACK_BUDGET_SEC*0.4: break
-    if not active:
-        print("[INFO] 開催検出0件"); return []
-    found=[]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs={}
-        for cc in sorted(active):
-            for rr in range(1, SCAN_R_MAX+1):
-                if time.time()-start > FALLBACK_BUDGET_SEC: break
-                rid = rid_for(d, cc, rr)
-                futs[ex.submit(try_one_rid, session, rid)] = rid
-        for fut in as_completed(futs):
-            try:
-                if fut.result(): found.append(futs[fut])
-            except: pass
-            if time.time()-start > FALLBACK_BUDGET_SEC: break
-    return list(dict.fromkeys(found))
-
-# ---------- 解析（shutuba:馬名 → tan/yoso:オッズ） ----------
-_ODDS_FLOAT_RE = re.compile(r"\b(\d{1,3}\.\d)\b")
-
-def fetch_odds_html(session, rid: str):
-    for u in candidate_odds_urls(rid):
-        html = fetch(session, u)
-        if not html: continue
-        t = norm(html)
-        if ("odds/tan" in u and "単勝" in t):
-            return ("tan", html)
-        if ("odds/yoso" in u and ("予想オッズ" in t or "オッズ" in t)):
-            return ("yoso", html)
-        if ("odds/index" in u and "オッズ" in t):
-            return ("index", html)
-    return (None, None)
-
-def fetch_shutuba_html(session, rid: str):
-    for u in candidate_shutuba_urls(rid):
-        html = fetch(session, u)
-        if html and ("出馬表" in norm(html) or "馬名" in norm(html) or "騎手" in norm(html)):
-            return html
-    return None
-
-def parse_race_meta_from_text(txt: str):
-    t = clean_line(txt)
-    m = re.search(rf"{VENUES}[^0-9]{{0,6}}(\d{{1,2}}R)", t)
-    title = f"{m.group(1)} {m.group(2)}" if m else (re.search(r"(\d{1,2}R)", t).group(1) if re.search(r"(\d{1,2}R)", t) else "（開催/レース不明）")
-    tm = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or
-          re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t) or
-          re.search(r"([01]?\d|2[0-3])時([0-5]\d)分\s*発走", t) or
-          re.search(r"発走[：:\s]*([01]?\d|2[0-3])時([0-5]\d)分", t))
-    if tm:
-        if len(tm.groups()) == 2 and "時" in tm.group(0):
-            hh = int(tm.group(1)); mm = int(tm.group(2))
-            post = f"{hh:02d}:{mm:02d}発走"
-        else:
-            post = f"{tm.group(1)}発走"
-    else:
-        post = ""
-    hc=None
-    hm=re.search(r"(\d{1,2})頭", t)
-    if hm:
-        try: hc=int(hm.group(1))
-        except: pass
-    return {"title": title, "post_time": post, "headcount": hc}
-
-def parse_meta(html: str):
+# ===== 日別レース一覧 → 各レースID, 発走時刻, 競馬場名/タイトル =====
+def parse_race_list_page(html: str):
+    """各Rの {race_id, post_time, title, course} を返す"""
     soup = BeautifulSoup(html, "html.parser")
-    return parse_race_meta_from_text(" ".join(x for x in soup.stripped_strings))
+    text_all = " ".join(x for x in soup.stripped_strings)
+    # 見出しの中に “2025年8月16日（土） 札幌/新潟/中京” のタブ
+    venues = []
+    for a in soup.select("a[href]"):
+        t = (a.get_text() or "").strip()
+        if t in ("札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"):
+            venues.append(t)
+    venue_str = " / ".join(sorted(set(venues)))  # 情報用
 
-def parse_shutuba_names(html: str):
+    rows = []
+    for a in soup.select("a[href]"):
+        href = a.get("href") or ""
+        m = RACE_INDEX_RE.search(href)
+        if not m:
+            continue
+        rid = m.group(1)  # 10桁
+        # 直近のテキストから発走時刻とレース名を推定
+        label = clean_line(a.get_text(" "))
+        # 発走時刻は前後に “HH:MM” が並ぶので、親要素テキストを使う
+        parent_txt = clean_line(a.find_parent().get_text(" ")) if a.find_parent() else label
+        tm = re.search(r"([01]?\d|2[0-3]):([0-5]\d)", parent_txt)
+        post = f"{int(tm.group(1)):02d}:{tm.group(2)}発走" if tm else ""
+        # レース名・距離など（リンクテキストで十分）
+        title = label if label else "（レース名不明）"
+        rows.append({"race_id": rid, "post_time": post, "title": title, "venues": venue_str})
+    # 重複排除
+    uniq = []
+    seen=set()
+    for r in rows:
+        if r["race_id"] in seen: continue
+        seen.add(r["race_id"]); uniq.append(r)
+    return uniq
+
+# ===== 出馬表（馬番→馬名）/頭数 =====
+def fetch_denma(session, rid: str) -> Dict[int,str]:
+    url = f"https://sports.yahoo.co.jp/keiba/race/denma/{rid}"
+    html = fetch(session, url)
+    if not html: return {}
     soup = BeautifulSoup(html, "html.parser")
     out={}
     for tr in soup.find_all("tr"):
-        no=None; name=None
-        if tr.has_attr("data-umaban"):
-            try: no=int(tr["data-umaban"])
-            except: pass
-        if no is None:
-            m=re.search(r"\b(\d{1,2})\b", clean_line(tr.get_text(" ")))
-            if m:
-                try:
-                    n=int(m.group(1))
-                    if 1<=n<=20: no=n
-                except: pass
-        a = tr.find("a")
-        if a and a.get_text(strip=True):
-            cand = clean_line(a.get_text(" "))
-            if not any(k in cand for k in ["馬券","オッズ","騎手","厩舎","斤量","発走","枠"]):
-                name=cand
-        if not name:
-            txt=clean_line(tr.get_text(" "))
-            for nm in re.findall(r"[一-龥ぁ-んァ-ヴーA-Za-z0-9][一-龥ぁ-んァ-ヴーA-Za-z0-9・\-’'\. ]{1,}", txt):
-                t=nm.strip()
-                if re.fullmatch(r"\d+", t): continue
-                if any(k in t for k in ["馬券","オッズ","人気","斤量","発走","枠","タイム","指数","騎手","厩舎","調教師","頭","R "]):
-                    continue
-                name=t; break
-        if (no and (1<=no<=20) and name):
-            out.setdefault(no, name)
-    return out  # {馬番: 馬名}
-
-def parse_tan_odds_by_row(html: str, names_map: dict):
-    soup = BeautifulSoup(html, "html.parser")
-    out = {}
-    for tr in soup.find_all("tr"):
-        txt = clean_line(tr.get_text(" "))
-        if not txt: continue
-        m_no = re.search(r"\b(\d{1,2})\b", txt)
-        if not m_no: continue
+        tds = [clean_line(td.get_text(" ")) for td in tr.find_all(["td","th"])]
+        if len(tds) < 3: continue
+        # 枠番, 馬番, 馬名 ... の並びを想定
         try:
-            no = int(m_no.group(1))
-            if not (1 <= no <= 20): continue
-        except: 
-            continue
-        m_od = _ODDS_FLOAT_RE.search(txt)
-        if not m_od: 
-            continue
-        try:
-            odds = float(m_od.group(1))
-            if not (1.0 <= odds <= 400.0): continue
+            umaban = int(tds[1])
         except:
             continue
-        out.setdefault(no, odds)
+        name = tds[2] or ""
+        if name and 1 <= umaban <= 20:
+            out[umaban] = name
     return out
 
-def parse_yoso_odds_by_name(html: str, names_map: dict):
-    soup = BeautifulSoup(html, "html.parser")
-    out = {}
-    rev = {normalize_name(v): k for k, v in names_map.items()}
-    for tr in soup.find_all("tr"):
-        txt = clean_line(tr.get_text(" "))
-        if not txt: continue
-        cand_name = None
-        for nm in re.findall(r"[一-龥ぁ-んァ-ンﾞﾟA-Za-z0-9][一-龥ぁ-んァ-ンﾞﾟA-Za-z0-9・\-’'\. ]{1,}", txt):
-            nm = nm.strip()
-            if re.fullmatch(r"\d+", nm): continue
-            if any(k in nm for k in ["馬券","オッズ","人気","斤量","発走","枠","タイム","指数","騎手","厩舎","調教師","頭","R "]):
-                continue
-            cand_name = nm; break
-        if not cand_name: continue
-        key = normalize_name(cand_name)
-        target_no = None
-        if key in rev: target_no = rev[key]
-        else:
-            for rkey, no in rev.items():
-                if key in rkey or rkey in key:
-                    target_no = no; break
-        if not target_no: continue
-        m_od = _ODDS_FLOAT_RE.search(txt)
-        if not m_od: continue
+def count_head(session, rid: str) -> Optional[int]:
+    url = f"https://sports.yahoo.co.jp/keiba/race/denma/{rid}"
+    html = fetch(session, url)
+    if not html: return None
+    nums=set()
+    for m in re.finditer(r">\s*([1-2]?\d)\s*</", html):
         try:
-            v = float(m_od.group(1))
-            if 1.0 <= v <= 400.0: out.setdefault(target_no, v)
+            n=int(m.group(1))
+            if 1<=n<=20: nums.add(n)
         except: pass
-    return out
+    return max(nums) if nums else None
 
-# ---------- 時刻（「発走」近傍のみ） ----------
-def extract_post_time_from_text(txt: str) -> str | None:
-    t = clean_line(txt)
-    pats = [
-        r"(\d{1,2}:\d{2})\s*発走",
-        r"発走[：:\s]*([0-2]?\d:[0-5]\d)",
-        r"([01]?\d|2[0-3])時([0-5]\d)分\s*発走",
-        r"発走[：:\s]*([01]?\d|2[0-3])時([0-5]\d)分",
-    ]
-    for p in pats:
-        m = re.search(p, t)
-        if m:
-            if len(m.groups()) == 2 and "時" in m.group(0):
-                hh = int(m.group(1)); mm = int(m.group(2))
-                return f"{hh:02d}:{mm:02d}発走"
-            return f"{m.group(1)}発走"
-    return None
+# ===== オッズ（単勝） =====
+def fetch_odds_tan(session, rid: str) -> Dict[int,float]:
+    """
+    単勝/複勝ページ（tfw）から “馬番→単勝” を直接取得
+    """
+    url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
+    html = fetch(session, url)
+    if not html: return {}
+    soup = BeautifulSoup(html, "html.parser")
+    result={}
+    for tr in soup.find_all("tr"):
+        tds = [clean_line(td.get_text(" ")) for td in tr.find_all("td")]
+        if len(tds) < 4:  # 枠番, 馬番, 馬名, 単勝, 複勝…
+            continue
+        try:
+            uma = int(tds[1])
+        except:
+            continue
+        # 単勝（小数っぽいものを最初に）
+        m = re.search(r"(\d{1,3}\.\d)", " ".join(tds[3:5]))
+        if not m:  # まれにオッズ未掲載タイミング
+            continue
+        try:
+            result[uma] = float(m.group(1))
+        except:
+            pass
+    return result
 
-def get_post_time(session, rid: str) -> str:
-    for u in candidate_odds_urls(rid):
-        html = fetch(session, u)
-        if html:
-            pt = extract_post_time_from_text(html)
-            if pt: return pt
-    for u in candidate_shutuba_urls(rid):
-        html = fetch(session, u)
-        if html:
-            pt = extract_post_time_from_text(html)
-            if pt: return pt
-    return ""
+# ===== スコアリング・券種 =====
+UPSET_WORDS = ["新馬", "2歳", "２歳", "重賞", "オープン", "障害", "混合"]
 
-# ---------- 的中率モード ----------
-UPSET_WORDS = ["新馬","未勝利","2歳","２歳","初出走","初ダ","初ダート","初距離","重賞","混合","オープン","ハンデ"]
-
-def is_low_variance_race(title: str, headcount: int | None, o1, o2) -> bool:
-    t = (title or "")
-    if any(w in t for w in UPSET_WORDS): return False
+def is_low_variance_race(title: str, headcount: Optional[int], o1, o2) -> bool:
+    t = title or ""
+    if any(w in t for w in UPSET_WORDS):
+        return False
     try:
-        o1f = float(o1) if o1 is not None else None
-        o2f = float(o2) if o2 is not None else None
-        gap = (o2f - o1f) if (o1f is not None and o2f is not None) else None
-        if o1f is None: return False
+        if o1 is None: return False
+        o1f = float(o1)
         if o1f > HIT_O1_MAX: return False
-        if gap is None or gap < HIT_GAP_MIN: return False
-        if headcount is not None and headcount > HIT_MAX_HEADS: return False
+        if o2 is None: return False
+        gap = float(o2) - o1f
+        if gap < HIT_GAP_MIN: return False
+        if (headcount is not None) and headcount > HIT_MAX_HEADS: return False
         return True
-    except Exception: return False
+    except:
+        return False
 
-# ---------- スコア & 推奨券種 ----------
 def score(o1, o2, hc):
-    s = 0.0
+    s=0.0
     try:
         if o1 is not None: s += max(0.0, (6.0 - float(o1))) * 12
-        if (o1 is not None) and (o2 is not None): s += max(0.0, float(o2) - float(o1)) * 10
-        if hc is not None: s += max(0.0, (18 - hc)) * 2.0
-    except Exception: pass
-    return round(s, 2)
+        if (o1 is not None) and (o2 is not None): s += max(0.0, float(o2)-float(o1)) * 10
+        if hc is not None: s += max(0.0, (18 - int(hc))) * 2.0
+    except: pass
+    return round(s,2)
 
 def pick_primary_bet(o1, o2, hc, rank):
     defaults = {1:"単勝（1点）", 2:"ワイド（1点）", 3:"複勝（1点）", 4:"単勝（1点）", 5:"ワイド（1点）"}
@@ -425,42 +255,38 @@ def pick_primary_bet(o1, o2, hc, rank):
         gap = (o2f - o1f) if (o1f is not None and o2f is not None) else None
         if o1f is not None and o1f <= 1.5:
             choice = "単勝（1点）"
-            if gap is not None and gap >= 1.2 and (hc is not None and hc <= HIT_MAX_HEADS):
+            if gap is not None and gap >= 1.0 and (hc is not None and hc <= HIT_MAX_HEADS):
                 choice = "馬連（1点）"
         elif o1f is not None and o1f <= 2.0 and (hc is not None and hc <= HIT_MAX_HEADS):
             choice = "ワイド（1点）"
         if hc is not None and hc >= 12:
             choice = "複勝（1点）"
-    except Exception: pass
+    except: pass
     return choice
 
-# ---------- 通知 ----------
+# ===== 出力 =====
 def build_message(items):
     header = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)"
     if not items:
         return header + "\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
     lines = [header]
     for idx, it in enumerate(items[:TOP_K], 1):
-        title = clean_line(it['title']); ptime = clean_line(it['post_time'])
+        title = clean_line(it.get('title') or "")
+        ptime = clean_line(it.get('post_time') or "")
+        left = "1人気想定"
+        right = "2人気想定"
         if it.get("no1"):
-            left = f"{circled(it['no1'])}" + (f" {it['name1']}" if it.get("name1") else "")
-            left += (f"（単勝{it['o1']}）" if it.get("o1") is not None else "")
-        else:
-            left = "1人気想定" + (f"（単勝{it['o1']}）" if it.get("o1") is not None else "")
+            left = f"{circled(it['no1'])}" + (f" {it.get('name1')}" if it.get('name1') else "")
+            if it.get("o1") is not None: left += f"（{it['o1']}）"
         if it.get("no2"):
-            right = f"{circled(it['no2'])}" + (f" {it['name2']}" if it.get("name2") else "")
-            right += (f"（単勝{it['o2']}）" if it.get("o2") is not None else "")
-        else:
-            right = "2人気想定" + (f"（単勝{it['o2']}）" if it.get("o2") is not None else "")
-        primary_bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
-        lines.append(f"【{idx}位】")
-        lines.append(f"{title} {ptime}".rstrip())
-        lines.append(f"◎本命：{left}")
-        lines.append(f"○対抗：{right}")
-        lines.append(f"推奨券種：{primary_bet}")
-        lines.append(f"参考：頭数={it.get('headcount')} / Score={it['score']}")
-        if idx < min(len(items), TOP_K):
-            lines.append("---")
+            right = f"{circled(it['no2'])}" + (f" {it.get('name2')}" if it.get('name2') else "")
+            if it.get("o2") is not None: right += f"（{it['o2']}）"
+        bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
+        lines.append(f"【{idx}位】{title} {ptime}".rstrip())
+        lines.append(f"◎{left}  ○{right}")
+        lines.append(f"推奨：{bet}")
+        lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
+        if idx < min(len(items), TOP_K): lines.append("---")
     return "\n".join(lines)
 
 def send_discord(msg: str, webhook: str):
@@ -468,15 +294,13 @@ def send_discord(msg: str, webhook: str):
     if not webhook:
         print("[Discord] Webhook未設定のためスキップ"); return
     try:
-        r=requests.post(webhook, json={"content": f"[ping] {now_jst_str()} - notifier alive"}, timeout=12)
-        r.raise_for_status()
+        requests.post(webhook, json={"content": f"[ping] {now_jst_str()} - notifier alive"}, timeout=12).raise_for_status()
     except Exception as e:
         print(f"[Discord] ping失敗: {e}"); return
-    for i in range(0,len(msg),DISCORD_CHUNK):
-        part=msg[i:i+DISCORD_CHUNK]
+    for i in range(0, len(msg), DISCORD_CHUNK):
+        part = msg[i:i+DISCORD_CHUNK]
         try:
-            r=requests.post(webhook, json={"content": part}, timeout=20)
-            r.raise_for_status()
+            requests.post(webhook, json={"content": part}, timeout=20).raise_for_status()
         except Exception as e:
             print(f"[Discord] 送信エラー: {e}"); break
 
@@ -485,111 +309,96 @@ def send_line(msg: str, token: str):
     if not token:
         print("[LINE] トークン未設定のためスキップ"); return
     try:
-        r=requests.post("https://notify-api.line.me/api/notify",
-                        headers={"Authorization": f"Bearer {token}"},
-                        data={"message": msg}, timeout=15)
-        r.raise_for_status()
+        requests.post("https://notify-api.line.me/api/notify",
+                      headers={"Authorization": f"Bearer {token}"},
+                      data={"message": msg}, timeout=15).raise_for_status()
     except Exception as e:
         print(f"[LINE] 送信エラー: {e}")
 
-# ---------- 1レース処理 ----------
-def process_one(session, rid: str):
+# ===== 1レース処理 =====
+def process_one(session, rid: str, meta_hint: dict):
     try:
-        # 馬名確定
-        names={}
-        sh_html = fetch_shutuba_html(session, rid)
-        if sh_html: names = parse_shutuba_names(sh_html)
-
-        # オッズ
-        odds_src, odds_html = fetch_odds_html(session, rid)
-        meta = None; odds_map = {}
-        if odds_html:
-            meta = parse_meta(odds_html)
-            if odds_src == "tan":
-                odds_map = parse_tan_odds_by_row(odds_html, names)
-            else:
-                if names: odds_map = parse_yoso_odds_by_name(odds_html, names)
-
-        # メタ補完
-        if not meta:
-            if not sh_html: sh_html = fetch_shutuba_html(session, rid)
-            if sh_html: meta = parse_meta(sh_html)
-            else: return None
-
-        if not meta.get("post_time"):
-            meta["post_time"] = get_post_time(session, rid) or ""
-
-        # 上位2頭
-        if odds_map:
-            pairs = sorted([(od, no) for no,od in odds_map.items()], key=lambda x: x[0])
-            o1,no1 = (pairs[0] if len(pairs)>=1 else (None,None))
-            o2,no2 = (pairs[1] if len(pairs)>=2 else (None,None))
-            nm1 = names.get(no1); nm2 = names.get(no2)
-        else:
-            o1=no1=nm1=None; o2=no2=nm2=None
-
-        return {
-            "title": meta["title"] if meta else "（開催/レース不明）",
-            "post_time": meta.get("post_time") if meta else "",
-            "headcount": meta.get("headcount") if meta else None,
+        # 出馬表（馬番→馬名）/頭数
+        names = fetch_denma(session, rid)
+        headcount = count_head(session, rid)
+        # 単勝オッズ
+        odds = fetch_odds_tan(session, rid)
+        o1=no1=nm1=None; o2=no2=nm2=None
+        if odds:
+            pairs = sorted([(v,k) for k,v in odds.items()], key=lambda x: x[0])
+            if len(pairs)>=1:
+                o1, no1 = pairs[0][0], pairs[0][1]
+                nm1 = names.get(no1)
+            if len(pairs)>=2:
+                o2, no2 = pairs[1][0], pairs[1][1]
+                nm2 = names.get(no2)
+        title = meta_hint.get("title") or "（レース）"
+        post = meta_hint.get("post_time") or ""
+        row = {
+            "title": title,
+            "post_time": post,
+            "headcount": headcount,
             "o1": o1, "o2": o2,
-            "no1": no1, "name1": nm1, "no2": no2, "name2": nm2,
-            "score": score(o1, o2, meta.get("headcount") if meta else None),
+            "no1": no1, "name1": nm1,
+            "no2": no2, "name2": nm2,
         }
+        row["score"] = score(o1, o2, headcount)
+        return row
     except Exception as e:
         print(f"[WARN] 解析失敗: {rid} -> {e}")
         return None
     finally:
         time.sleep(SLEEP_SEC)
 
-# ---------- メイン ----------
+# ===== メイン =====
 def main():
     ymd = resolve_target_date()
-    print(f"[INFO] 対象日(JRA): {ymd}")
-    session = make_session()
+    print(f"[INFO] TARGET_DATE={ymd} (JST)")
+    sess = make_session()
 
-    # 1) 一覧収集
-    ids = collect_race_ids_from_lists(session, ymd)
-
-    # 2) 少ない/0件ならフォールバック
-    if len(ids) < 8:
-        add = bruteforce_race_ids(session, ymd)
-        print(f"[INFO] フォールバック追加: {len(add)}件")
-        ids = list(dict.fromkeys(ids + add))
-
-    if not ids:
+    # 1) 月間→当日の日別リストURL（各競馬場）
+    list_urls = find_day_list_urls(sess, ymd)
+    if not list_urls:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
-        send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL",""))
-        send_line(msg, os.getenv("LINE_NOTIFY_TOKEN",""))
-        print("----- 通知本文 -----\n"+msg); return
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
-    # 3) 解析（並列）
+    # 2) 各会場の “レース一覧” から race_id 群を収集
+    meta_rows=[]
+    for url in list_urls:
+        html = fetch(sess, url)
+        if not html: continue
+        rows = parse_race_list_page(html)
+        meta_rows.extend(rows)
+        time.sleep(0.2)
+    # 重複除去
+    seen=set(); metas=[]
+    for r in meta_rows:
+        if r["race_id"] in seen: continue
+        seen.add(r["race_id"]); metas.append(r)
+
+    if not metas:
+        msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
+
+    # 3) 各レース解析（順次）
     results=[]
-    with ThreadPoolExecutor(max_workers=ANALYZE_WORKERS) as ex:
-        futs = {ex.submit(process_one, session, rid): rid for rid in ids}
-        for fut in as_completed(futs):
-            row = fut.result()
-            if row: results.append(row)
+    for m in metas:
+        row = process_one(sess, m["race_id"], m)
+        if row: results.append(row)
 
-    # 3.5) 安全レース抽出（的中率）
-    safe = []
-    for it in results:
-        if not re.search(VENUES, it.get("title","")):  # 中央の場名でフィルタ
-            continue
-        if is_low_variance_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2")):
-            safe.append(it)
+    # 4) 的中率モード：安全レースのみ抽出
+    safe = [it for it in results if is_low_variance_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2"))]
     if safe: results = safe
 
-    # 4) ランキング
+    # 5) スコア降順 → 出力
     results.sort(key=lambda x: x["score"], reverse=True)
     msg = build_message(results)
 
-    # 5) 通知
-    send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL",""))
-    send_line(msg, os.getenv("LINE_NOTIFY_TOKEN",""))
-
+    # 6) 通知
     print("----- 通知本文 -----")
     print(msg)
+    send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL",""))
+    send_line(msg, os.getenv("LINE_NOTIFY_TOKEN",""))
 
 if __name__ == "__main__":
     main()
