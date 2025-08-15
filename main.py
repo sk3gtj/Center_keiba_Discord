@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版・表示強化）
-- タイトル: 「開催場 〇R コース/距離」形式
-- 発走時刻: HH:MM発走 を表示
-- ◎/○ に単勝オッズを併記
-- ヘッダーに「※オッズは取得時点のものです」を追加
+中央競馬 “今日の堅そう” ランキング TOP5（Yahoo!スポーツナビ版・表示&精度修正）
+- タイトル/発走時刻/場名/距離は **オッズ(tfw)ページ**から抽出（ナビ1R誤認を回避）
+- R番号は **race_idの下2桁**で確定
+- 馬名は denma 由来でも **性別/年齢/毛色/斤量っぽい表記を除去** して表示
+- ヘッダーに「※オッズは取得時点のものです」を明記
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -25,7 +25,7 @@ HIT_MAX_HEADS = int(os.getenv("HIT_MAX_HEADS", "10"))
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.1"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.2"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
@@ -104,101 +104,93 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
 
 def parse_race_list_page(html: str):
     """
-    各Rの {race_id, title(仮), post_time(仮)} を返す。
-    正式タイトル/時刻は出馬表ページでも再抽出（こちらは保険）。
+    各Rの {race_id} を返す（タイトル/時刻はオッズページから正規取得するのでここでは仮は持たない）
     """
     soup = BeautifulSoup(html, "html.parser")
-    rows = []
+    ids=[]
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
         m = RACE_INDEX_RE.search(href)
         if not m: continue
         rid = m.group(1)  # 10桁
-        label = clean_line(a.get_text(" ")) or "（レース）"
-        # 近傍の “HH:MM” を拾う（親要素テキスト）
-        parent_txt = clean_line(a.find_parent().get_text(" ")) if a.find_parent() else label
-        tm = re.search(r"([01]?\d|2[0-3]):([0-5]\d)", parent_txt)
-        post = f"{int(tm.group(1)):02d}:{tm.group(2)}発走" if tm else ""
-        rows.append({"race_id": rid, "title": label, "post_time": post})
-    # ユニーク
-    seen=set(); uniq=[]
-    for r in rows:
-        if r["race_id"] in seen: continue
-        seen.add(r["race_id"]); uniq.append(r)
-    return uniq
+        if rid not in ids: ids.append(rid)
+    return ids
 
-# ===== 出馬表ページからメタ・馬名・頭数 =====
-def parse_meta_from_denma_text(txt: str) -> dict:
-    """
-    出馬表（denma）ページ全テキストから、
-    - 開催場 / R / コース距離（芝/ダ/障 + 数字）/ 発走時刻（“発走”近傍）を抽出
-    """
-    t = clean_line(txt)
-    # 開催場
-    venue = ""
-    for v in JRA_VENUES:
-        if v in t:
-            venue = v
-            break
-    # R
-    m_r = re.search(r"(\d{1,2})R", t)
-    R = f"{m_r.group(1)}R" if m_r else ""
-    # コース/距離
-    m_cd = re.search(r"(芝|ダート|障害)\s*([1-4]\d{2,3})", t)
-    course = f"{m_cd.group(1)}{m_cd.group(2)}" if m_cd else ""
-    # 発走時刻（発走の近傍）
-    m_time = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or
-              re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t) or
-              re.search(r"([01]?\d|2[0-3])時([0-5]\d)分\s*発走", t) or
-              re.search(r"発走[：:\s]*([01]?\d|2[0-3])時([0-5]\d)分", t))
-    if m_time:
-        if len(m_time.groups()) == 2 and "時" in m_time.group(0):
-            hh = int(m_time.group(1)); mm = int(m_time.group(2))
-            post = f"{hh:02d}:{mm:02d}発走"
-        else:
-            post = f"{m_time.group(1)}発走"
-    else:
-        post = ""
-    title = " ".join(x for x in [venue, R, course] if x)
-    return {"venue": venue, "R": R, "course": course, "post_time": post, "title": title or "（レース）"}
+# ===== 出馬表（denma）から馬番→馬名（表示用はノイズ除去） =====
+NAME_NOISE_RE = re.compile(r"\s*[牡牝セ騸]\d(?:/)?[^\s（）()]*")  # 例: " 牝2/鹿毛" など
+def clean_horse_name(nm: str) -> str:
+    nm = clean_line(nm)
+    nm = NAME_NOISE_RE.sub("", nm)
+    nm = re.sub(r"\s*(?:[（(].*?[）)])\s*$", "", nm)  # 末尾の括弧注釈を除去
+    return nm.strip()
 
-def fetch_denma(session, rid: str):
-    """
-    出馬表（denma）を取得して
-    - names: {馬番: 馬名}
-    - meta: {title, post_time}
-    - headcount: int
-    """
+def fetch_denma_names(session, rid: str) -> Dict[int,str]:
+    """出馬表（denma）から {馬番: 馬名(クリーン)} を取得"""
     url = f"https://sports.yahoo.co.jp/keiba/race/denma/{rid}"
     html = fetch(session, url)
-    if not html: return {}, {"title": "（レース）", "post_time": ""}, None
+    if not html: return {}
     soup = BeautifulSoup(html, "html.parser")
     names={}
     for tr in soup.find_all("tr"):
         tds = [clean_line(td.get_text(" ")) for td in tr.find_all(["td","th"])]
         if len(tds) < 3: continue
-        # 枠番, 馬番, 馬名 … の並びが多い
         try:
-            uma = int(tds[1])
+            uma = int(tds[1])  # [枠, 馬, 馬名...]
         except:
             continue
-        name = tds[2] or ""
+        name = clean_horse_name(tds[2] or "")
         if name and 1 <= uma <= 20:
             names[uma] = name
-    headcount = max(names.keys()) if names else None
-    meta = parse_meta_from_denma_text(" ".join(x for x in soup.stripped_strings))
-    return names, meta, headcount
+    return names
 
-# ===== 単勝オッズ =====
-def fetch_odds_tan(session, rid: str) -> Dict[int,float]:
+# ===== オッズ(tfw)からメタ/オッズ取得（メインの真実ソース） =====
+_ODDS_FLOAT_RE = re.compile(r"\b(\d{1,3}\.\d)\b")
+def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     """
-    単勝/複勝ページ（tfw）から “馬番→単勝” を取得
+    tfwページから:
+      - venue（例: 中京）
+      - R（ridの下2桁）
+      - course+distance（例: ダート1800m / 芝1200m）
+      - post_time（HH:MM発走）
+      - race_name（例: 揖斐川特別 / サラ系3歳未勝利）
+    を抽出してタイトルを「<venue> <R> <course>」に整形
+    """
+    t = clean_line(txt)
+    # venue（「3回中京6日」のような部分から場名を抽出）
+    venue = ""
+    for v in JRA_VENUES:
+        if v in t:
+            venue = v; break
+    # R：rid末尾2桁
+    rnum = int(rid[-2:])
+    R = f"{rnum}R"
+    # race_name：h2/h3見出し優先
+    race_name = ""
+    mname = re.search(r"(?:^|[\s#])([一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+特別|[一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+ステークス|サラ系[^\s]+|新馬戦|未勝利|オープン|G[ⅠI]{1,3}|L)\b", t)
+    if mname:
+        race_name = mname.group(1)
+    # course/distance（例: 芝・右 1200m / ダート・左 1800m）
+    mcd = re.search(r"(芝|ダート|障害)[^0-9]{0,6}([1-4]\d{2,3})m", t)
+    course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
+    # 発走時刻
+    mtime = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or
+             re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t))
+    post = f"{mtime.group(1)}発走" if mtime else ""
+    title = " ".join(x for x in [venue, R, course or race_name] if x)
+    return {"venue": venue, "R": R, "course": course, "post_time": post, "race_name": race_name, "title": title or f"{venue} {R}".strip()}
+
+def fetch_odds_and_meta(session, rid: str):
+    """
+    tfwから
+      - odds_map: {馬番: 単勝}
+      - meta: {title, post_time, ...}
+    を返す
     """
     url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
     html = fetch(session, url)
-    if not html: return {}
+    if not html: return {}, {"title":"（レース）","post_time":""}
     soup = BeautifulSoup(html, "html.parser")
-    result={}
+    odds={}
     for tr in soup.find_all("tr"):
         tds = [clean_line(td.get_text(" ")) for td in tr.find_all("td")]
         if len(tds) < 4:  # [枠, 馬, 馬名, 単勝, 複勝...]
@@ -207,15 +199,16 @@ def fetch_odds_tan(session, rid: str) -> Dict[int,float]:
             uma = int(tds[1])
         except:
             continue
-        # 単勝（小数を拾う）
-        m = re.search(r"(\d{1,3}\.\d)", " ".join(tds[3:5]))
+        # 単勝（最初の小数）
+        m = _ODDS_FLOAT_RE.search(" ".join(tds[3:5]))
         if not m: 
             continue
         try:
-            result[uma] = float(m.group(1))
+            odds[uma] = float(m.group(1))
         except:
             pass
-    return result
+    meta = parse_meta_from_odds_page_text(" ".join(x for x in soup.stripped_strings), rid)
+    return odds, meta
 
 # ===== スコアリング・券種 =====
 UPSET_WORDS = ["新馬","2歳","２歳","重賞","オープン","障害","混合","未勝利"]
@@ -315,13 +308,14 @@ def send_line(msg: str, token: str):
         print(f"[LINE] 送信エラー: {e}")
 
 # ===== 1レース処理 =====
-def process_one(session, rid: str, meta_hint: dict):
+def process_one(session, rid: str):
     try:
-        # 出馬表（馬番→馬名）/頭数/正式メタ
-        names, meta_denma, headcount = fetch_denma(session, rid)
-        # 単勝オッズ
-        odds = fetch_odds_tan(session, rid)
-        o1=no1=nm1=None; o2=no2=nm2=None
+        # 1) オッズ(tfw)からオッズ＆正式メタ
+        odds, meta = fetch_odds_and_meta(session, rid)
+        # 2) 馬名（denma）— 表示用にクリーン
+        names = fetch_denma_names(session, rid) if odds else {}
+        # 3) 上位2頭
+        o1=no1=nm1=None; o2=no2=nm2=None; headcount = max(names.keys()) if names else None
         if odds:
             pairs = sorted([(v,k) for k,v in odds.items()], key=lambda x: x[0])
             if len(pairs)>=1:
@@ -330,12 +324,9 @@ def process_one(session, rid: str, meta_hint: dict):
             if len(pairs)>=2:
                 o2, no2 = pairs[1][0], pairs[1][1]
                 nm2 = names.get(no2)
-        # タイトル/時刻は denma 優先、無ければ list のヒント
-        title = meta_denma.get("title") or meta_hint.get("title") or "（レース）"
-        post = meta_denma.get("post_time") or meta_hint.get("post_time") or ""
         row = {
-            "title": title,
-            "post_time": post,
+            "title": meta.get("title") or "（レース）",
+            "post_time": meta.get("post_time") or "",
             "headcount": headcount,
             "o1": o1, "o2": o2,
             "no1": no1, "name1": nm1,
@@ -362,27 +353,23 @@ def main():
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
     # 2) 各会場の “レース一覧” から race_id 群を収集
-    meta_rows=[]
+    race_ids=[]
     for url in list_urls:
         html = fetch(sess, url)
         if not html: continue
-        rows = parse_race_list_page(html)
-        meta_rows.extend(rows)
+        ids = parse_race_list_page(html)
+        for rid in ids:
+            if rid not in race_ids: race_ids.append(rid)
         time.sleep(0.2)
-    # 重複除去
-    seen=set(); metas=[]
-    for r in meta_rows:
-        if r["race_id"] in seen: continue
-        seen.add(r["race_id"]); metas.append(r)
 
-    if not metas:
+    if not race_ids:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
     # 3) 各レース解析（順次）
     results=[]
-    for m in metas:
-        row = process_one(sess, m["race_id"], m)
+    for rid in race_ids:
+        row = process_one(sess, rid)
         if row: results.append(row)
 
     # 4) 的中率モード：安全レースのみ抽出
