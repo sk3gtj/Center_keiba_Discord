@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬 “今日の堅そう” ランキング（Yahoo!スポーツナビ版・venueをindexで確定）
-- 会場名はレースTOP(index)ページから確定取得（最優先）
-- oddsページ・listページの venue はフォールバック
+中央競馬 “今日の堅そう” ランキング（Yahoo!スポーツナビ版・会場確定安定版）
+- 会場は oddsページ<title> 最優先 → index → oddsの推測 → listヒント
 - スコアは全レース横断で計算し、高い順に採用
 - “堅い基準”を満たすレースのみ最大5件（不足時は件数が減る）
 - 重複は race_id で排除、◎/○ は改行、単勝オッズ併記
+- ヘッダーに「※オッズは取得時点のものです」
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -31,7 +31,7 @@ EXCLUDE_WORDS = [w.strip() for w in os.getenv(
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.9"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/2.0"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
@@ -113,7 +113,7 @@ def parse_venue_from_list_page(soup: BeautifulSoup) -> str:
     """（保険）会場名のヒント。indexで確定するので使えなくてもOK"""
     text = clean_line(" ".join(x for x in soup.stripped_strings))
     for v in JRA_VENUES:
-        if re.search(rf"\b{re.escape(v)}\b", text):
+        if v in text:
             return v
     return ""
 
@@ -158,14 +158,25 @@ def fetch_denma_names(session, rid: str) -> Dict[int,str]:
             names[uma] = name
     return names
 
+# ===== venue 抽出（堅牢：<title>優先） =====
+def venue_from_title_only(soup: BeautifulSoup) -> str:
+    """<title> に含まれる会場名だけを見て確定する（最も堅牢）"""
+    title = ""
+    if soup.title and soup.title.text:
+        title = clean_line(soup.title.text)
+    for v in JRA_VENUES:
+        if v in title:
+            return v
+    return ""
+
 # ===== odds / index からメタ取得 =====
 def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
+    """odds(tfw)の本文から R/距離/発走（venueは推測のみ）"""
     t = clean_line(txt)
-    # venue はここでは拾わない（index優先）。ある場合は保険で返す
-    venue = ""
+    venue_guess = ""
     for v in JRA_VENUES:
-        if re.search(rf"\b{re.escape(v)}\b", t):
-            venue = v; break
+        if v in t:
+            venue_guess = v; break
     R = f"{int(rid[-2:])}R"
     mname = re.search(r"(?:^|[\s#])([一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+特別|[一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+ステークス|サラ系[^\s]+|新馬戦|未勝利|オープン|G[ⅠI]{1,3}|L)\b", t)
     race_name = mname.group(1) if mname else ""
@@ -173,17 +184,19 @@ def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
     mtime = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t))
     post = f"{mtime.group(1)}発走" if mtime else ""
-    return {"venue_guess": venue, "R": R, "course": course, "post_time": post, "race_name": race_name}
+    return {"venue_guess": venue_guess, "R": R, "course": course, "post_time": post, "race_name": race_name}
 
-def fetch_odds_and_meta(session, rid: str) -> Tuple[Dict[int,float], dict]:
+def fetch_odds_and_meta_html(session, rid: str) -> Tuple[Optional[str], Dict[int,float], dict, Optional[BeautifulSoup]]:
     url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
     html = fetch(session, url)
-    if not html: return {}, {"venue_guess":"", "R":"", "course":"", "post_time":"", "race_name":""}
+    if not html:
+        return None, {}, {"venue_guess":"", "R":"", "course":"", "post_time":"", "race_name":""}, None
     soup = BeautifulSoup(html, "html.parser")
+    # 単勝オッズ抽出
     odds={}
     for tr in soup.find_all("tr"):
         tds = [clean_line(td.get_text(" ")) for td in tr.find_all("td")]
-        if len(tds) < 4:  # [枠, 馬, 馬名, 単勝, 複勝...]
+        if len(tds) < 4:
             continue
         try:
             uma = int(tds[1])
@@ -197,48 +210,34 @@ def fetch_odds_and_meta(session, rid: str) -> Tuple[Dict[int,float], dict]:
         except:
             pass
     meta = parse_meta_from_odds_page_text(" ".join(x for x in soup.stripped_strings), rid)
-    return odds, meta
+    return html, odds, meta, soup
 
 def fetch_index_meta(session, rid: str) -> dict:
-    """
-    ★ venue確定用：レースTOP(index)から venue / R / course / post_time を抽出
-    可能な限り CSS セレクタ優先、なければタイトル/本文の正規表現で補完
-    """
+    """レースTOP(index)から venue / R / course / post_time を抽出（フォールバック）"""
     url = f"https://sports.yahoo.co.jp/keiba/race/index/{rid}"
     html = fetch(session, url)
     if not html: return {"venue":"", "R":"", "course":"", "post_time":"", "race_name":""}
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) ターゲット要素から venue を推定（見出し・パンくず・タイトル）
     candidates = []
-    # ページタイトル
     if soup.title and soup.title.text:
         candidates.append(clean_line(soup.title.text))
-    # パンくず
-    for sel in ["nav", ".breadcrumb", ".Breadcrumb", "ol", "ul"]:
+    for sel in ["nav", ".breadcrumb", ".Breadcrumb", "ol", "ul", "h1","h2",".Heading",".RaceTitle",".RaceDetail__title"]:
         for el in soup.select(sel):
             candidates.append(clean_line(el.get_text(" ")))
-    # 見出し
-    for sel in ["h1","h2",".Heading",".RaceTitle",".RaceDetail__title"]:
-        for el in soup.select(sel):
-            candidates.append(clean_line(el.get_text(" ")))
-    # 本文の先頭付近
     candidates.append(clean_line(" ".join(x for x in soup.stripped_strings)[:400]))
 
     text = " ".join(candidates)
     venue = ""
     for v in JRA_VENUES:
-        if re.search(rf"\b{re.escape(v)}\b", text):
+        if v in text:
             venue = v; break
 
-    # R / course / post_time は odds と同様パターンで拾う
     R = f"{int(rid[-2:])}R"
     mcd = re.search(r"(芝|ダート|障害)[^0-9]{0,6}([1-4]\d{2,3})m", text)
     course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
     mtime = (re.search(r"(\d{1,2}:\d{2})\s*発走", text) or re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", text))
     post = f"{mtime.group(1)}発走" if mtime else ""
-
-    # レース名（あるとタイトルが読みやすい）
     mname = re.search(r"([一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+特別|[一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+ステークス|サラ系[^\s]+|新馬戦|未勝利|オープン|G[ⅠI]{1,3}|L)\b", text)
     rname = mname.group(1) if mname else ""
 
@@ -343,18 +342,22 @@ def send_line(msg: str, token: str):
 # ===== 1レース処理 =====
 def process_one(session, rid: str, venue_hint: str):
     try:
-        # 1) オッズ＆簡易メタ
-        odds, meta_odds = fetch_odds_and_meta(session, rid)
-        # 2) indexメタ（★venue確定）
+        # 1) odds HTML 取得（<title>で venue 確定を狙う）
+        html_odds, odds, meta_odds, soup_odds = fetch_odds_and_meta_html(session, rid)
+        v_from_title = venue_from_title_only(soup_odds) if soup_odds else ""
+
+        # 2) indexメタ（フォールバック）
         meta_idx = fetch_index_meta(session, rid)
 
-        # venue: index > odds(guess) > list hint
-        venue = (meta_idx.get("venue") or meta_odds.get("venue_guess") or venue_hint or "").strip()
+        # 3) venue 決定優先度：<title>(odds) > index > odds_guess > list hint
+        venue = (v_from_title or meta_idx.get("venue") or meta_odds.get("venue_guess") or venue_hint or "").strip()
+
+        # 4) R / course / post は index > odds
         R = meta_idx.get("R") or meta_odds.get("R") or f"{int(rid[-2:])}R"
         course = meta_idx.get("course") or meta_odds.get("course") or ""
         post = meta_idx.get("post_time") or meta_odds.get("post_time") or ""
 
-        # 馬名
+        # 5) 馬名
         names = fetch_denma_names(session, rid) if odds else {}
         o1=no1=nm1=None; o2=no2=nm2=None; headcount = max(names.keys()) if names else None
         if odds:
