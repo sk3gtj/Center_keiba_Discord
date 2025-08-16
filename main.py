@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬 “今日の堅そう” ランキング（Yahoo!スポーツナビ版）
+中央競馬 “今日の堅そう” ランキング（Yahoo!スポーツナビ版・開催場Fix）
+- 会場（札幌/新潟/中京…）は「会場別レース一覧ページ」から確定取得して引き回す
 - スコアは全レース横断で計算し、高い順に採用
 - “堅い基準”を満たすレースのみ最大5件（不足時は件数が減る）
 - 重複は race_id で排除
@@ -32,7 +33,7 @@ EXCLUDE_WORDS = [w.strip() for w in os.getenv(
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.6"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/1.7"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
@@ -66,8 +67,8 @@ def resolve_target_date() -> str:
     env = (os.getenv("TARGET_DATE") or "").strip()
     if re.fullmatch(r"\d{8}", env):  # YYYYMMDD
         return env
-    # 近い土日を採用（Actionsは土日7:00 JST想定）
     d = now_jst().date()
+    # 土日じゃなければ直近の土日へ
     while d.weekday() not in (5, 6):
         d += dt.timedelta(days=1)
     return d.strftime("%Y%m%d")
@@ -93,6 +94,7 @@ def monthly_url_for(yyyymmdd: str) -> str:
     return f"{MONTHLY_URL}?month={m}&year={y}"
 
 def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
+    """月間ページから当日の日別レース一覧URL（各競馬場）を抽出"""
     html = fetch(session, monthly_url_for(yyyymmdd))
     if not html: return []
     list_ids = list(dict.fromkeys(LIST_RE.findall(html)))
@@ -107,7 +109,23 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
         time.sleep(0.1 + random.random()*0.2)
     return out
 
-def parse_race_list_page(html: str) -> List[str]:
+def parse_venue_from_list_page(soup: BeautifulSoup) -> str:
+    """
+    会場名をレース一覧ページから確実に取得。
+    見出しやパンくず等に「札幌」「新潟」「中京」等が必ず出るので、それを優先採用。
+    """
+    text = clean_line(" ".join(x for x in soup.stripped_strings))
+    for v in JRA_VENUES:
+        if v in text:
+            return v
+    # 見つからなければ空（後段のoddsページ保険に任せる）
+    return ""
+
+def parse_race_list_page(html: str, venue_hint: str) -> List[Tuple[str,str]]:
+    """
+    各レースの race_id(10桁) を収集し、venue_hint とペアで返す。
+    戻り値: [(rid, venue_hint), ...]
+    """
     soup = BeautifulSoup(html, "html.parser")
     ids=[]
     for a in soup.select("a[href]"):
@@ -115,7 +133,8 @@ def parse_race_list_page(html: str) -> List[str]:
         m = RACE_INDEX_RE.search(href)
         if not m: continue
         rid = m.group(1)
-        if rid not in ids: ids.append(rid)
+        if rid not in [x[0] for x in ids]:
+            ids.append((rid, venue_hint))
     return ids
 
 # ===== 出馬表（denma）から 馬番→馬名（表示用はノイズ除去） =====
@@ -146,11 +165,10 @@ def fetch_denma_names(session, rid: str) -> Dict[int,str]:
 
 # ===== オッズ(tfw)から メタ/オッズ 取得（主ソース） =====
 def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
+    """
+    oddsページのテキストから R/距離/発走 を拾う（venueはlistページのhint優先）
+    """
     t = clean_line(txt)
-    venue = ""
-    for v in JRA_VENUES:
-        if v in t:
-            venue = v; break
     R = f"{int(rid[-2:])}R"
     race_name = ""
     mname = re.search(r"(?:^|[\s#])([一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+特別|[一-龥ぁ-んァ-ンA-Za-z0-9･・\-]+ステークス|サラ系[^\s]+|新馬戦|未勝利|オープン|G[ⅠI]{1,3}|L)\b", t)
@@ -159,13 +177,12 @@ def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
     course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
     mtime = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t))
     post = f"{mtime.group(1)}発走" if mtime else ""
-    title = " ".join(x for x in [venue, R, course or race_name] if x)
-    return {"venue": venue, "R": R, "course": course, "post_time": post, "race_name": race_name, "title": title or f"{venue} {R}".strip()}
+    return {"R": R, "course": course, "post_time": post, "race_name": race_name}
 
 def fetch_odds_and_meta(session, rid: str) -> Tuple[Dict[int,float], dict]:
     url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
     html = fetch(session, url)
-    if not html: return {}, {"title":"（レース）","post_time":""}
+    if not html: return {}, {"R":"", "course":"", "post_time":"", "race_name":""}
     soup = BeautifulSoup(html, "html.parser")
     odds={}
     for tr in soup.find_all("tr"):
@@ -283,7 +300,7 @@ def send_line(msg: str, token: str):
         print(f"[LINE] 送信エラー: {e}")
 
 # ===== 1レース処理 =====
-def process_one(session, rid: str):
+def process_one(session, rid: str, venue_hint: str):
     try:
         odds, meta = fetch_odds_and_meta(session, rid)
         names = fetch_denma_names(session, rid) if odds else {}
@@ -294,10 +311,18 @@ def process_one(session, rid: str):
                 o1, no1 = pairs[0][0], pairs[0][1]; nm1 = names.get(no1)
             if len(pairs)>=2:
                 o2, no2 = pairs[1][0], pairs[1][1]; nm2 = names.get(no2)
+
+        # タイトル構築：venue_hint を最優先で使用
+        R = meta.get("R","")
+        course = meta.get("course","")
+        post = meta.get("post_time","")
+        venue = (venue_hint or "").strip()
+        title = " ".join(x for x in [venue, R, course] if x)
+
         row = {
             "rid": rid,
-            "title": meta.get("title") or "（レース）",
-            "post_time": meta.get("post_time") or "",
+            "title": title or "（レース）",
+            "post_time": post or "",
             "headcount": headcount,
             "o1": o1, "o2": o2,
             "no1": no1, "name1": nm1,
@@ -323,38 +348,37 @@ def main():
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
-    # 2) race_id 収集（重複排除）
-    race_ids=[]
+    # 2) race_id と venue を収集（重複排除）
+    race_items: List[Tuple[str,str]] = []  # (rid, venue)
     for url in list_urls:
         html = fetch(sess, url)
         if not html: continue
-        ids = parse_race_list_page(html)
-        for rid in ids:
-            if rid not in race_ids: race_ids.append(rid)
+        soup = BeautifulSoup(html, "html.parser")
+        venue_hint = parse_venue_from_list_page(soup)  # 確定会場
+        ids = parse_race_list_page(html, venue_hint)
+        for rid, v in ids:
+            if rid not in [x[0] for x in race_items]:
+                race_items.append((rid, v))
         time.sleep(0.2)
-    if not race_ids:
+
+    if not race_items:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
     # 3) 各レース解析
     results=[]
-    for rid in race_ids:
-        row = process_one(sess, rid)
+    for rid, venue in race_items:
+        row = process_one(sess, rid, venue)
         if row: results.append(row)
 
     # 4) スコア降順
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # 5) “堅い基準”を満たすものだけを race_id で重複排除して採用
+    # 5) “堅い基準”を満たすものだけ採用（重複はrid管理済み）
     picked=[]
-    seen_rids=set()
     for it in results:
         if not is_hard_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2")):
             continue
-        rid = it.get("rid")
-        if rid in seen_rids:  # 念のため
-            continue
-        seen_rids.add(rid)
         picked.append(it)
         if len(picked) >= TOP_K:
             break
