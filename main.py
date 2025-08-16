@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-中央競馬 “今日の堅そう” ランキング（Yahoo!スポーツナビ版・会場先頭一致Fix）
-- 会場は「各会場のレース一覧ページ」の見出し/タイトルから“先頭一致”で確定
-- フォールバックは odds ページ<title>（こちらも先頭一致）
-- スコアは全レース横断で計算し、閾値を満たす最大5件を採用
-- ◎/○ は改行、単勝オッズ併記、ヘッダーに注意書き
+中央競馬 “今日の堅そう” ランキング（スポナビ版・venueはindex<title>の先頭マッチ）
+- 会場名は「レースTOP(index)の<title>」から“最初に現れる場名”を確定採用
+  * 例: 「札幌 9R … – 競馬 – スポーツナビ」→ 札幌
+- オッズは tfw（単勝）を使用、出馬表(denma)で馬名と頭数を取得
+- 閾値（O1_MAX, GAP_MIN, HC_MAX）を満たすレースのみ最大5件
+- 出力は◎/○を改行、注意書き「※オッズは取得時点のものです」付き
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -30,7 +31,7 @@ EXCLUDE_WORDS = [w.strip() for w in os.getenv(
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/2.1"),
+                   "Chrome/125.0.0.0 Safari/537.36 CenterKeiba/2.2"),
     "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     "Referer": "https://sports.yahoo.co.jp/keiba/",
     "Cache-Control": "no-cache",
@@ -108,31 +109,10 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
         time.sleep(0.1 + random.random()*0.2)
     return out
 
-def venue_from_list_page_strict(soup: BeautifulSoup) -> str:
-    """
-    ★会場は見出し/タイトルの“先頭一致”で抽出（他会場名に引っ張られない）
-    優先順: h1 -> .Heading/.ModTitle/.RaceList__title -> <title>
-    """
-    texts = []
-    h1 = soup.select_one("h1")
-    if h1: texts.append(clean_line(h1.get_text(" ")))
-    for sel in [".Heading", ".ModTitle", ".RaceList__title"]:
-        el = soup.select_one(sel)
-        if el: texts.append(clean_line(el.get_text(" ")))
-    if soup.title and soup.title.text:
-        texts.append(clean_line(soup.title.text))
-    for t in texts:
-        for v in JRA_VENUES:
-            if t.startswith(v):
-                return v
-    # 先頭一致で拾えない場合は空（この後 odds<title> にフォールバック）
-    return ""
-
 def parse_race_list_page(html: str, venue_hint: str) -> List[Tuple[str,str]]:
-    """各レースの race_id(10桁) を venueヒントとセットで返す"""
+    """各レースの race_id(10桁) を venueヒントとセットで返す（ヒントは未使用でもOK）"""
     soup = BeautifulSoup(html, "html.parser")
-    ids=[]
-    seen=set()
+    ids=[]; seen=set()
     for a in soup.select("a[href]"):
         href = a.get("href") or ""
         m = RACE_INDEX_RE.search(href)
@@ -143,11 +123,23 @@ def parse_race_list_page(html: str, venue_hint: str) -> List[Tuple[str,str]]:
         ids.append((rid, venue_hint))
     return ids
 
+# ===== venue 抽出：index<title> の“最初に現れる場名” =====
+def venue_from_title_first(soup: Optional[BeautifulSoup]) -> str:
+    if not soup or not soup.title or not soup.title.text:
+        return ""
+    t = clean_line(soup.title.text)
+    # タイトル内に出てくる最初の場名を採用
+    earliest = (None, 10**9)
+    for v in JRA_VENUES:
+        pos = t.find(v)
+        if pos != -1 and pos < earliest[1]:
+            earliest = (v, pos)
+    return earliest[0] or ""
+
 # ===== 出馬表（denma）から 馬番→馬名 =====
 NAME_NOISE_RE = re.compile(r"\s*[牡牝セ騸]\d(?:/)?[^\s（）()]*")
 def clean_horse_name(nm: str) -> str:
-    nm = clean_line(nm)
-    nm = NAME_NOISE_RE.sub("", nm)
+    nm = clean_line(nm); nm = NAME_NOISE_RE.sub("", nm)
     nm = re.sub(r"\s*(?:[（(].*?[）)])\s*$", "", nm)
     return nm.strip()
 
@@ -170,28 +162,21 @@ def fetch_denma_names(session, rid: str) -> Dict[int,str]:
     return names
 
 # ===== odds / index からメタ取得 =====
-def parse_meta_from_odds_page_text(txt: str, rid: str) -> dict:
-    """odds(tfw)の本文から R/距離/発走（venueは推測のみ）"""
+def parse_meta_from_odds_text(txt: str, rid: str) -> dict:
     t = clean_line(txt)
-    venue_guess = ""
-    # 先頭一致ではない（本文は場所名が先頭に来ないことがある）ので“推測”扱い
-    for v in JRA_VENUES:
-        if v in t:
-            venue_guess = v; break
     R = f"{int(rid[-2:])}R"
     mcd = re.search(r"(芝|ダート|障害)[^0-9]{0,6}([1-4]\d{2,3})m", t)
     course = f"{mcd.group(1)}{mcd.group(2)}" if mcd else ""
     mtime = (re.search(r"(\d{1,2}:\d{2})\s*発走", t) or re.search(r"発走[：:\s]*([0-2]?\d:[0-5]\d)", t))
     post = f"{mtime.group(1)}発走" if mtime else ""
-    return {"venue_guess": venue_guess, "R": R, "course": course, "post_time": post}
+    return {"R": R, "course": course, "post_time": post}
 
-def fetch_odds_and_meta_html(session, rid: str) -> Tuple[Optional[str], Dict[int,float], dict, Optional[BeautifulSoup]]:
+def fetch_odds_and_meta(session, rid: str):
     url = f"https://sports.yahoo.co.jp/keiba/race/odds/tfw/{rid}"
     html = fetch(session, url)
     if not html:
-        return None, {}, {"venue_guess":"", "R":"", "course":"", "post_time":""}, None
+        return {}, {"R":"", "course":"", "post_time":""}, None
     soup = BeautifulSoup(html, "html.parser")
-    # 単勝オッズ抽出
     odds={}
     for tr in soup.find_all("tr"):
         tds = [clean_line(td.get_text(" ")) for td in tr.find_all("td")]
@@ -202,30 +187,22 @@ def fetch_odds_and_meta_html(session, rid: str) -> Tuple[Optional[str], Dict[int
         except:
             continue
         m = ODDS_FLOAT_RE.search(" ".join(tds[3:5]))
-        if not m:
-            continue
+        if not m: continue
         try:
             odds[uma] = float(m.group(1))
-        except:
-            pass
-    meta = parse_meta_from_odds_page_text(" ".join(x for x in soup.stripped_strings), rid)
-    return html, odds, meta, soup
+        except: pass
+    meta = parse_meta_from_odds_text(" ".join(x for x in soup.stripped_strings), rid)
+    return odds, meta, soup
 
-def venue_from_odds_title_strict(soup: Optional[BeautifulSoup]) -> str:
-    """odds ページの <title> から会場を“先頭一致”で抽出"""
-    if not soup or not soup.title or not soup.title.text:
-        return ""
-    t = clean_line(soup.title.text)
-    for v in JRA_VENUES:
-        if t.startswith(v):
-            return v
-    return ""
+def fetch_index_title_soup(session, rid: str) -> Optional[BeautifulSoup]:
+    url = f"https://sports.yahoo.co.jp/keiba/race/index/{rid}"
+    html = fetch(session, url)
+    return BeautifulSoup(html, "html.parser") if html else None
 
 # ===== スコアリング・“堅い基準” =====
 def is_hard_race(title: str, headcount: Optional[int], o1, o2) -> bool:
     t = title or ""
-    if any(w in t for w in EXCLUDE_WORDS):
-        return False
+    if any(w in t for w in EXCLUDE_WORDS): return False
     try:
         if o1 is None or o2 is None: return False
         o1f = float(o1); o2f = float(o2)
@@ -233,8 +210,7 @@ def is_hard_race(title: str, headcount: Optional[int], o1, o2) -> bool:
         if (o2f - o1f) < GAP_MIN: return False
         if (headcount is not None) and headcount > HC_MAX: return False
         return True
-    except:
-        return False
+    except: return False
 
 def score(o1, o2, hc):
     s=0.0
@@ -320,20 +296,19 @@ def send_line(msg: str, token: str):
 # ===== 1レース処理 =====
 def process_one(session, rid: str, venue_hint: str):
     try:
-        # odds HTML（<title>も使う）
-        html_odds, odds, meta_odds, soup_odds = fetch_odds_and_meta_html(session, rid)
-        v_from_odds_title = venue_from_odds_title_strict(soup_odds)
+        # 1) odds（単勝オッズ、R/コース/発走）
+        odds, meta_odds, soup_odds = {}, {"R":"", "course":"", "post_time":""}, None
+        odds, meta_odds, soup_odds = fetch_odds_and_meta(session, rid)
 
-        # denmaで頭数/名前
+        # 2) index<title> で venue を確定（本文は見ない）
+        soup_index = fetch_index_title_soup(session, rid)
+        venue = venue_from_title_first(soup_index) or venue_from_title_first(soup_odds) or venue_hint or ""
+
+        # 3) 出馬表（頭数/馬名）
         names = fetch_denma_names(session, rid) if odds else {}
         headcount = max(names.keys()) if names else None
 
-        # R/course/post は odds本文から（十分）
-        R = meta_odds.get("R") or f"{int(rid[-2:])}R"
-        course = meta_odds.get("course", "")
-        post = meta_odds.get("post_time", "")
-
-        # 上位2頭（オッズ昇順）
+        # 4) 上位2頭（オッズ昇順）
         o1=no1=nm1=None; o2=no2=nm2=None
         if odds:
             pairs = sorted([(v,k) for k,v in odds.items()], key=lambda x: x[0])
@@ -342,12 +317,14 @@ def process_one(session, rid: str, venue_hint: str):
             if len(pairs)>=2:
                 o2, no2 = pairs[1][0], pairs[1][1]; nm2 = names.get(no2)
 
-        # タイトル（venueは後で確定）
+        R = meta_odds.get("R") or f"{int(rid[-2:])}R"
+        course = meta_odds.get("course","")
+        post = meta_odds.get("post_time","")
+
         row = {
             "rid": rid,
-            "venue_hint": venue_hint,
-            "venue_from_odds": v_from_odds_title,
-            "R": R, "course": course, "post_time": post,
+            "title": " ".join(x for x in [venue, R, course] if x) or "（レース）",
+            "post_time": post or "",
             "headcount": headcount,
             "o1": o1, "o2": o2,
             "no1": no1, "name1": nm1,
@@ -373,19 +350,18 @@ def main():
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
-    # 2) race_id と venue（一覧ページの“先頭一致”で確定）を収集
-    race_items: List[Tuple[str,str]] = []  # (rid, venue_from_list)
+    # 2) race_id 収集（venue_hint は保険で持つだけ）
+    race_items: List[Tuple[str,str]] = []
     seen=set()
     for url in list_urls:
         html = fetch(sess, url)
         if not html: continue
         soup = BeautifulSoup(html, "html.parser")
-        venue_list = venue_from_list_page_strict(soup)  # ★ここで会場を厳密に
-        ids = parse_race_list_page(html, venue_list)
-        for rid, v in ids:
+        # 一覧ページの見出し/タイトルから先頭の場名が取れればヒントに
+        venue_hint = venue_from_title_first(soup)  # なくてもOK
+        for rid, v in parse_race_list_page(html, venue_hint):
             if rid in seen: continue
-            seen.add(rid)
-            race_items.append((rid, v))
+            seen.add(rid); race_items.append((rid, v))
         time.sleep(0.2)
 
     if not race_items:
@@ -393,21 +369,17 @@ def main():
         print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
 
     # 3) 各レース解析
-    rows=[]
-    for rid, vlist in race_items:
-        row = process_one(sess, rid, vlist)
-        if row: rows.append(row)
+    results=[]
+    for rid, vh in race_items:
+        row = process_one(sess, rid, vh)
+        if row: results.append(row)
 
-    # 4) venueを最終確定（list先頭一致 > odds<title>先頭一致 > ヒント）
-    for r in rows:
-        venue = r.get("venue_hint") or r.get("venue_from_odds") or ""
-        r["venue"] = venue
-        r["title"] = " ".join(x for x in [venue, r.get("R",""), r.get("course","")] if x)
+    # 4) スコア降順
+    results.sort(key=lambda x: x["score"], reverse=True)
 
-    # 5) スコア降順 & 閾値適合のみ
-    rows.sort(key=lambda x: x["score"], reverse=True)
+    # 5) 閾値適合のみ採用（最大TOP_K）
     picked=[]
-    for it in rows:
+    for it in results:
         if not is_hard_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2")):
             continue
         picked.append(it)
@@ -415,33 +387,6 @@ def main():
             break
 
     # 6) 出力
-    def build_message(items):
-        header = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです"
-        if not items:
-            return header + "\n見送り：閾値を満たすレースがありません（オッズ未公開/対象外の可能性）"
-        lines = [header]
-        for idx, it in enumerate(items[:TOP_K], 1):
-            title = clean_line(it.get('title') or "")
-            ptime = clean_line(it.get('post_time') or "")
-            if it.get("no1"):
-                left = f"{circled(it['no1'])}" + (f" {it.get('name1')}" if it.get('name1') else "")
-                left += f"（単勝{it['o1']}）" if it.get("o1") is not None else "（オッズ未確定）"
-            else:
-                left = "1人気想定（オッズ未確定）" if it.get("o1") is None else f"1人気想定（単勝{it['o1']}）"
-            if it.get("no2"):
-                right = f"{circled(it['no2'])}" + (f" {it.get('name2')}" if it.get('name2') else "")
-                right += f"（単勝{it['o2']}）" if it.get("o2") is not None else "（オッズ未確定）"
-            else:
-                right = "2人気想定（オッズ未確定）" if it.get("o2") is None else f"2人気想定（単勝{it['o2']}）"
-            bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
-            lines.append(f"【{idx}位】{title} {ptime}".rstrip())
-            lines.append(f"◎{left}")
-            lines.append(f"○{right}")
-            lines.append(f"推奨：{bet}")
-            lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
-            if idx < min(len(items), TOP_K): lines.append("---")
-        return "\n".join(lines)
-
     msg = build_message(picked)
     print("----- 通知本文 -----")
     print(msg)
