@@ -2,20 +2,37 @@ name: Central Keiba
 
 on:
   schedule:
-    - cron: "0 0 * * 6,7"  # JST 9:00 = UTC 0:00 (土日)
+    - cron: "0 0 * * 6,0"  # JST 9:00 (= UTC 0:00) / 土(6)・日(0)
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: central-keiba
+      cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install requests beautifulsoup4
+
       - name: Run script
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LINE_NOTIFY_TOKEN: ${{ secrets.LINE_NOTIFY_TOKEN }}
+          # 任意のしきい値調整（必要なら）
+          # O1_MAX: "2.0"
+          # GAP_MIN: "0.7"
+          # HC_MAX: "12"
         run: python main.py
