@@ -1,38 +1,21 @@
-name: Center Keiba (JRA) – Weekend 7:00 JST
+name: Central Keiba
 
 on:
   schedule:
-    # JST 7:00 は UTC 22:00（前日）。土曜・日曜の 7:00 に実行
-    - cron: "0 22 * * 5,6"
-  workflow_dispatch: {}
+    - cron: "0 0 * * 6,7"  # JST 9:00 = UTC 0:00 (土日)
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v3
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
-
-      - name: Install deps
-        # 既に requirements.txt がある場合はこちらを使う
+          python-version: '3.11'
+      - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests beautifulsoup4
-          fi
-
+          pip install requests beautifulsoup4
       - name: Run script
-        env:
-          # 必要ならDiscordやLINEの秘密をリポジトリSecretsに設定し、ここで参照
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          LINE_NOTIFY_TOKEN: ${{ secrets.LINE_NOTIFY_TOKEN }}
-        run: |
-          python main.py
+        run: python main.py
