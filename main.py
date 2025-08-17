@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 中央競馬 “今日の堅そう” ランキング（スポナビ版・venueはindex<title>の先頭マッチ）
-- 会場名は「レースTOP(index)の<title>」から“最初に現れる場名”を確定採用
-  * 例: 「札幌 9R … – 競馬 – スポーツナビ」→ 札幌
-- オッズは tfw（単勝）を使用、出馬表(denma)で馬名と頭数を取得
-- 閾値（O1_MAX, GAP_MIN, HC_MAX）を満たすレースのみ最大5件
-- 出力は◎/○を改行、注意書き「※オッズは取得時点のものです」付き
+- 会場名は index<title> の最初に現れる場名で確定
+- オッズは tfw（単勝）／出馬表(denma)で馬名と頭数
+- 閾値（O1_MAX,GAP_MIN,HC_MAX）を満たすレースのみ最大5件
+- 通知は Discord Webhook と LINE Messaging API Push（LINE Notifyは廃止）
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -39,7 +38,7 @@ HEADERS = {
 }
 
 # 丸数字
-CIRCLES = {i: chr(9311+i) for i in range(1, 21)}  # ①..⑳
+CIRCLES = {i: chr(9311+i) for i in range(1, 21)}
 def circled(n: int) -> str: return CIRCLES.get(n, f"[{n}]")
 
 # 会場候補
@@ -94,7 +93,6 @@ def monthly_url_for(yyyymmdd: str) -> str:
     return f"{MONTHLY_URL}?month={m}&year={y}"
 
 def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
-    """月間ページから当日の日別レース一覧URL（各競馬場）を抽出"""
     html = fetch(session, monthly_url_for(yyyymmdd))
     if not html: return []
     list_ids = list(dict.fromkeys(LIST_RE.findall(html)))
@@ -110,7 +108,6 @@ def find_day_list_urls(session, yyyymmdd: str) -> List[str]:
     return out
 
 def parse_race_list_page(html: str, venue_hint: str) -> List[Tuple[str,str]]:
-    """各レースの race_id(10桁) を venueヒントとセットで返す（ヒントは未使用でもOK）"""
     soup = BeautifulSoup(html, "html.parser")
     ids=[]; seen=set()
     for a in soup.select("a[href]"):
@@ -128,7 +125,6 @@ def venue_from_title_first(soup: Optional[BeautifulSoup]) -> str:
     if not soup or not soup.title or not soup.title.text:
         return ""
     t = clean_line(soup.title.text)
-    # タイトル内に出てくる最初の場名を採用
     earliest = (None, 10**9)
     for v in JRA_VENUES:
         pos = t.find(v)
@@ -239,34 +235,7 @@ def pick_primary_bet(o1, o2, hc, rank):
     except: pass
     return choice
 
-# ===== 出力 =====
-def build_message(items):
-    header = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです"
-    if not items:
-        return header + "\n見送り：閾値を満たすレースがありません（オッズ未公開/対象外の可能性）"
-    lines = [header]
-    for idx, it in enumerate(items[:TOP_K], 1):
-        title = clean_line(it.get('title') or "")
-        ptime = clean_line(it.get('post_time') or "")
-        if it.get("no1"):
-            left = f"{circled(it['no1'])}" + (f" {it.get('name1')}" if it.get('name1') else "")
-            left += f"（単勝{it['o1']}）" if it.get("o1") is not None else "（オッズ未確定）"
-        else:
-            left = "1人気想定（オッズ未確定）" if it.get("o1") is None else f"1人気想定（単勝{it['o1']}）"
-        if it.get("no2"):
-            right = f"{circled(it['no2'])}" + (f" {it.get('name2')}" if it.get('name2') else "")
-            right += f"（単勝{it['o2']}）" if it.get("o2") is not None else "（オッズ未確定）"
-        else:
-            right = "2人気想定（オッズ未確定）" if it.get("o2") is None else f"2人気想定（単勝{it['o2']}）"
-        bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
-        lines.append(f"【{idx}位】{title} {ptime}".rstrip())
-        lines.append(f"◎{left}")
-        lines.append(f"○{right}")
-        lines.append(f"推奨：{bet}")
-        lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
-        if idx < min(len(items), TOP_K): lines.append("---")
-    return "\n".join(lines)
-
+# ===== 通知 =====
 def send_discord(msg: str, webhook: str):
     webhook=(webhook or "").strip()
     if not webhook:
@@ -282,33 +251,32 @@ def send_discord(msg: str, webhook: str):
         except Exception as e:
             print(f"[Discord] 送信エラー: {e}"); break
 
-def send_line(msg: str, token: str):
-    token=(token or "").strip()
-    if not token:
-        print("[LINE] トークン未設定のためスキップ"); return
+def send_line_bot_push(msg: str):
+    """LINE Messaging API で Push 送信（LINE Notifyは廃止）"""
+    token = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+    to_user = (os.getenv("LINE_TO_USER_ID") or "").strip()
+    if not token or not to_user:
+        print("[LINE Bot] トークン or 送信先未設定のためスキップ"); return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {"to": to_user, "messages": [{"type": "text", "text": msg[:4900]}]}
     try:
-        requests.post("https://notify-api.line.me/api/notify",
-                      headers={"Authorization": f"Bearer {token}"},
-                      data={"message": msg}, timeout=15).raise_for_status()
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+        r.raise_for_status()
+        print("[LINE Bot] 送信OK")
     except Exception as e:
-        print(f"[LINE] 送信エラー: {e}")
+        print(f"[LINE Bot] 送信エラー: {e}")
 
 # ===== 1レース処理 =====
 def process_one(session, rid: str, venue_hint: str):
     try:
-        # 1) odds（単勝オッズ、R/コース/発走）
-        odds, meta_odds, soup_odds = {}, {"R":"", "course":"", "post_time":""}, None
         odds, meta_odds, soup_odds = fetch_odds_and_meta(session, rid)
-
-        # 2) index<title> で venue を確定（本文は見ない）
         soup_index = fetch_index_title_soup(session, rid)
         venue = venue_from_title_first(soup_index) or venue_from_title_first(soup_odds) or venue_hint or ""
 
-        # 3) 出馬表（頭数/馬名）
         names = fetch_denma_names(session, rid) if odds else {}
         headcount = max(names.keys()) if names else None
 
-        # 4) 上位2頭（オッズ昇順）
         o1=no1=nm1=None; o2=no2=nm2=None
         if odds:
             pairs = sorted([(v,k) for k,v in odds.items()], key=lambda x: x[0])
@@ -338,6 +306,34 @@ def process_one(session, rid: str, venue_hint: str):
     finally:
         time.sleep(SLEEP_SEC)
 
+# ===== 出力 =====
+def build_message(items):
+    header = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです"
+    if not items:
+        return header + "\n見送り：閾値を満たすレースがありません（オッズ未公開/対象外の可能性）"
+    lines = [header]
+    for idx, it in enumerate(items[:TOP_K], 1):
+        title = clean_line(it.get('title') or "")
+        ptime = clean_line(it.get('post_time') or "")
+        if it.get("no1"):
+            left = f"{circled(it['no1'])}" + (f" {it.get('name1')}" if it.get('name1') else "")
+            left += f"（単勝{it['o1']}）" if it.get("o1") is not None else "（オッズ未確定）"
+        else:
+            left = "1人気想定（オッズ未確定）" if it.get("o1") is None else f"1人気想定（単勝{it['o1']}）"
+        if it.get("no2"):
+            right = f"{circled(it['no2'])}" + (f" {it.get('name2')}" if it.get('name2') else "")
+            right += f"（単勝{it['o2']}）" if it.get("o2") is not None else "（オッズ未確定）"
+        else:
+            right = "2人気想定（オッズ未確定）" if it.get("o2") is None else f"2人気想定（単勝{it['o2']}）"
+        bet = pick_primary_bet(it.get("o1"), it.get("o2"), it.get("headcount"), idx)
+        lines.append(f"【{idx}位】{title} {ptime}".rstrip())
+        lines.append(f"◎{left}")
+        lines.append(f"○{right}")
+        lines.append(f"推奨：{bet}")
+        lines.append(f"参考：頭数={it.get('headcount')} / score={it.get('score')}")
+        if idx < min(len(items), TOP_K): lines.append("---")
+    return "\n".join(lines)
+
 # ===== メイン =====
 def main():
     ymd = resolve_target_date()
@@ -348,7 +344,7 @@ def main():
     list_urls = find_day_list_urls(sess, ymd)
     if not list_urls:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
-        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_bot_push(msg); return
 
     # 2) race_id 収集（venue_hint は保険で持つだけ）
     race_items: List[Tuple[str,str]] = []
@@ -357,7 +353,6 @@ def main():
         html = fetch(sess, url)
         if not html: continue
         soup = BeautifulSoup(html, "html.parser")
-        # 一覧ページの見出し/タイトルから先頭の場名が取れればヒントに
         venue_hint = venue_from_title_first(soup)  # なくてもOK
         for rid, v in parse_race_list_page(html, venue_hint):
             if rid in seen: continue
@@ -366,7 +361,7 @@ def main():
 
     if not race_items:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
-        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line(msg, os.getenv("LINE_NOTIFY_TOKEN","")); return
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_bot_push(msg); return
 
     # 3) 各レース解析
     results=[]
@@ -374,10 +369,8 @@ def main():
         row = process_one(sess, rid, vh)
         if row: results.append(row)
 
-    # 4) スコア降順
+    # 4) スコア降順 → 5) 閾値適合のみTOP_K
     results.sort(key=lambda x: x["score"], reverse=True)
-
-    # 5) 閾値適合のみ採用（最大TOP_K）
     picked=[]
     for it in results:
         if not is_hard_race(it.get("title",""), it.get("headcount"), it.get("o1"), it.get("o2")):
@@ -386,12 +379,12 @@ def main():
         if len(picked) >= TOP_K:
             break
 
-    # 6) 出力
+    # 6) 出力 & 通知
     msg = build_message(picked)
     print("----- 通知本文 -----")
     print(msg)
     send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL",""))
-    send_line(msg, os.getenv("LINE_NOTIFY_TOKEN",""))
+    send_line_bot_push(msg)
 
 if __name__ == "__main__":
     main()
