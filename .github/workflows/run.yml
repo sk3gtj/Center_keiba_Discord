@@ -2,7 +2,7 @@ name: Central Keiba
 
 on:
   schedule:
-    - cron: "0 0 * * 6,0"     # 土曜(6), 日曜(0) の 09:00 JST (UTC 0:00)
+    - cron: "0 0 * * 6,0"  # JST 9:00 (= UTC 0:00) / 土(6)・日(0)
   workflow_dispatch:
 
 jobs:
@@ -27,21 +27,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Guard: run only Sat/Sun 09:00 JST (schedule only)
-        if: github.event_name == 'schedule'
-        run: |
-          HOUR_JST=$(date -u -d '+9 hours' +%H)
-          DOW_JST=$(date -u -d '+9 hours' +%u)  # 1=Mon ... 7=Sun
-          echo "Triggered by schedule. JST now: $(date -u -d '+9 hours' --iso-8601=seconds)"
-          if [ "$DOW_JST" -ne 6 ] && [ "$DOW_JST" -ne 7 ]; then
-            echo "Not weekend in JST. Skip."; exit 0; fi
-          if [ "$HOUR_JST" != "09" ]; then
-            echo "Not 09 JST. Skip."; exit 0; fi
-
       - name: Run script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          # 可変パラメータ（必要ならSecretsに入れて使ってもOK）
           # O1_MAX: "2.0"
           # GAP_MIN: "0.7"
           # HC_MAX: "12"
