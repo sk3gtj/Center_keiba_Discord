@@ -4,7 +4,7 @@
 - 会場名は index<title> の最初に現れる場名で確定
 - オッズは tfw（単勝）／出馬表(denma)で馬名と頭数
 - 閾値（O1_MAX,GAP_MIN,HC_MAX）を満たすレースのみ最大5件
-- 通知は Discord Webhook と LINE Messaging API Push（LINE Notifyは廃止）
+- 通知は Discord Webhook と LINE Messaging API **Broadcast**（LINE Notifyは廃止）
 """
 
 import os, re, time, unicodedata, datetime as dt, random
@@ -251,19 +251,18 @@ def send_discord(msg: str, webhook: str):
         except Exception as e:
             print(f"[Discord] 送信エラー: {e}"); break
 
-def send_line_bot_push(msg: str):
-    """LINE Messaging API で Push 送信（LINE Notifyは廃止）"""
+def send_line_broadcast(msg: str):
+    """LINE Messaging API で **Broadcast** 送信（友だち全員に一斉送信）"""
     token = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
-    to_user = (os.getenv("LINE_TO_USER_ID") or "").strip()
-    if not token or not to_user:
-        print("[LINE Bot] トークン or 送信先未設定のためスキップ"); return
-    url = "https://api.line.me/v2/bot/message/push"
+    if not token:
+        print("[LINE Bot] トークン未設定のためスキップ"); return
+    url = "https://api.line.me/v2/bot/message/broadcast"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    body = {"to": to_user, "messages": [{"type": "text", "text": msg[:4900]}]}
+    body = {"messages": [{"type": "text", "text": msg[:4900]}]}
     try:
         r = requests.post(url, headers=headers, json=body, timeout=15)
         r.raise_for_status()
-        print("[LINE Bot] 送信OK")
+        print("[LINE Bot] Broadcast送信OK")
     except Exception as e:
         print(f"[LINE Bot] 送信エラー: {e}")
 
@@ -344,7 +343,7 @@ def main():
     list_urls = find_day_list_urls(sess, ymd)
     if not list_urls:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
-        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_bot_push(msg); return
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_broadcast(msg); return
 
     # 2) race_id 収集（venue_hint は保険で持つだけ）
     race_items: List[Tuple[str,str]] = []
@@ -361,7 +360,7 @@ def main():
 
     if not race_items:
         msg = f"{now_jst_str()} 中央競馬 “今日の堅そう”ランキング(最大{TOP_K}件)\n※オッズは取得時点のものです\n見送り：収集0件 or 解析不可（サイト構造変更の可能性）"
-        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_bot_push(msg); return
+        print(msg); send_discord(msg, os.getenv("DISCORD_WEBHOOK_URL","")); send_line_broadcast(msg); return
 
     # 3) 各レース解析
     results=[]
