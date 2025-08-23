@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Guard: run only Sat/Sun 09:00 JST (skip if scheduled)
+      - name: Guard: run only Sat/Sun 09:00 JST (schedule only)
         if: github.event_name == 'schedule'
         run: |
           HOUR_JST=$(date -u -d '+9 hours' +%H)
