@@ -2,7 +2,7 @@ name: Central Keiba
 
 on:
   schedule:
-    - cron: "0 0 * * 6,0"  # JST 9:00 (= UTC 0:00) / 土(6)・日(0)
+    - cron: "30 23 * * 5,6"  # 土(5→JSTでは土曜朝), 日(6→JSTでは日曜朝) の 08:30 JST (= 23:30 UTC)
   workflow_dispatch:
 
 jobs:
